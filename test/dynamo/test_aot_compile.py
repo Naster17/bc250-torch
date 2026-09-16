@@ -612,6 +612,23 @@ class ModeBranchGlobalModule(torch.nn.Module):
         return x * 2
 
 
+class SelfModeBranchGlobalModule(torch.nn.Module):
+    # The same branch on an attribute rather than an argument: the guard on
+    # self.mode is a LOCAL_UNSPECIALIZED_NN_MODULE source, which sorts after
+    # GLOBAL, so the root's G accessor is installed -- and fails -- before the
+    # self.mode guard (the L['x'] TENSOR_MATCH, a LOCAL, comes before both), and
+    # check_verbose quotes only the first failing accessor's parts, so the
+    # self.mode mismatch is invisible to a report on the missing global.
+    def __init__(self, mode):
+        super().__init__()
+        self.mode = mode
+
+    def forward(self, x):
+        if self.mode == 1:
+            return x * AOT_BRANCH_SCALE
+        return x * 2
+
+
 class SetIterModule(torch.nn.Module):
     # Iterating a set guards each element through a set-index accessor, which
     # reports a failure with NO verbose code parts when the set it is asked about
@@ -2753,6 +2770,49 @@ from user code:
         self.assertIn("[0] L['mode'] == 0", message)
         self.assertIn("Add a ModelInput", message)
 
+    def test_no_match_message_advises_an_input_for_a_missing_global(self):
+        # A report every entry of which names a missing global still has to
+        # advise an input: guards are installed in sorted(guards) order, so the
+        # root's G accessor runs before an nn.Module attribute guard and the
+        # KeyError is all the report gets to see -- the mismatch it hides is
+        # self.mode, and an input captured for the mode == 2 branch would not
+        # read AOT_BRANCH_SCALE at all. Withholding the advice here leaves the
+        # call with no actionable line, and which line the report withholds must
+        # not turn on whether an unrelated global happens to be defined.
+        self._hide_leaked_dynamo_globals()
+        mod = SelfModeBranchGlobalModule(1)
+        model = torch.compile(
+            mod,
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        x = torch.randn(3, 3)
+        model._aot_compile([ModelInput(args=(x,), kwargs={}, contexts=[])])
+        mod.mode = 2
+        g = globals()
+        saved = g.pop("AOT_BRANCH_SCALE")
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                model(x)
+            message = str(ctx.exception)
+        finally:
+            g["AOT_BRANCH_SCALE"] = saved
+        self.assertIn("[0] KeyError on G['AOT_BRANCH_SCALE']", message)
+        self.assertNotIn("L['self'].mode", message)
+        self.assertIn("For [0]: a guarded global is missing", message)
+        # The footer is unconditional at this tree; this fences a future gate on
+        # it. The case that pairs a hinted entry with a plain mismatch, one
+        # hinted and one not, is hints_only_the_entry_that_named_a_missing_global's.
+        self.assertIn("Add a ModelInput", message)
+        # The mismatch the entry above hid: with the global back, the same call
+        # fails on self.mode alone. Second, not first, because a failed check()
+        # re-sorts the root's children by fail count, which would have put this
+        # guard ahead of the G accessor for the call above.
+        with self.assertRaises(RuntimeError) as ctx:
+            model(x)
+        self.assertIn("[0] L['self'].mode == 1", str(ctx.exception))
+
     def test_no_match_message_hint_covers_a_rebound_forward(self):
         # The load resolves the guard scope from model.forward, the INSTANCE
         # attribute, so the dict the guards read is the globals of the function
@@ -2809,6 +2869,147 @@ from user code:
             self.assertEqual(reloaded(x), x @ saved)
         finally:
             g["AOT_HERMETIC_WEIGHT"] = saved
+
+    def test_no_match_message_hint_stays_neutral_for_a_supplied_scope(self):
+        # deserialize skips _resolve_guard_scope when the caller passes
+        # guard_globals=, so the guards hold THAT dict rather than the globals of
+        # the function model.forward resolves to. Here that dict never had the
+        # name (names_the_resolved_module reaches the wording through a stale
+        # copy of this module's dict), and the assertions after the wording
+        # measure the advice: the name defined in the supplied dict, where the
+        # hint sends the reader, is what serves the call.
+        self._hide_leaked_dynamo_globals()
+        x = torch.randn(3, 3)
+        model = torch.compile(
+            HermeticModule(),
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        model._aot_compile([ModelInput(args=(x,), kwargs={}, contexts=[])])
+        data = model._save_aot_compiled_module()
+
+        torch._dynamo.reset()
+        scope: dict[str, object] = {"__builtins__": builtins}
+        compiled = AOTCompiledModel.deserialize(
+            HermeticModule(), data, guard_globals=scope
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            compiled(x)
+        message = str(ctx.exception)
+        self.assertIn("[0] KeyError on G['AOT_HERMETIC_WEIGHT']", message)
+        self.assertIn(
+            "For [0]: a guarded global is missing from the live scope this artifact "
+            "was loaded against; define it there",
+            message,
+        )
+        self.assertNotIn("instance's forward", message)
+        # The guards hold the supplied dict, not this module's, where the name
+        # read below resolves and the class's forward is defined.
+        self.assertIs(compiled.compiled_results[0]._guard_globals, scope)
+        scope["AOT_HERMETIC_WEIGHT"] = AOT_HERMETIC_WEIGHT
+        self.assertEqual(compiled(x), x @ AOT_HERMETIC_WEIGHT)
+
+    def test_no_match_message_names_forward_only_for_the_dict_it_resolves_to(self):
+        # Two SUPPLIED results whose guards hold different dicts: one a load
+        # resolved from model.forward, so it is this module's, and one the
+        # caller supplied, which no forward resolves to. The report resolves
+        # forward once and compares that one dict against each entry's, so only
+        # the entry holding it is told which forward -- whichever entry is first.
+        global GLOBAL_POOLING_CONFIG
+
+        x = torch.randn(4, 8)
+        data = self._two_input_global_guard_artifact(x)
+        by_forward = AOTCompiledModel.deserialize(GlobalConfigModule(), data)
+        scope: dict[str, object] = {"__builtins__": builtins}
+        by_caller = AOTCompiledModel.deserialize(
+            GlobalConfigModule(), data, guard_globals=scope
+        )
+        self.assertIs(by_forward.compiled_results[0]._guard_globals, globals())
+        self.assertIs(by_caller.compiled_results[0]._guard_globals, scope)
+        saved = GLOBAL_POOLING_CONFIG
+        self.addCleanup(globals().__setitem__, "GLOBAL_POOLING_CONFIG", saved)
+        del GLOBAL_POOLING_CONFIG
+        named = "this GlobalConfigModule instance's forward resolves to"
+        neutral = "the live scope this artifact was loaded against; define it there"
+        pair = by_forward.compiled_results[:1] + by_caller.compiled_results[:1]
+        target = "torch._dynamo.aot_compile._resolve_guard_scope"
+        cases = ((pair, [named, neutral]), (pair[::-1], [neutral, named]))
+        for results, wording in cases:
+            mixed = AOTCompiledModel(GlobalConfigModule(), results)
+            resolve = patch(target, wraps=_resolve_guard_scope)
+            with resolve as resolves, self.assertRaises(RuntimeError) as ctx:
+                mixed(x)
+            resolves.assert_called_once_with(mixed.model)
+            message = str(ctx.exception)
+            self.assertIn("[0] KeyError on G['GLOBAL_POOLING_CONFIG']", message)
+            self.assertIn("[1] KeyError on G['GLOBAL_POOLING_CONFIG']", message)
+            hints = [line for line in message.splitlines() if line.startswith("For [")]
+            prefixes = [line[:9] for line in hints]
+            self.assertEqual(prefixes, ["For [0]: ", "For [1]: "], message)
+            for hint, want in zip(hints, wording):
+                self.assertIn(want, hint)
+
+    def test_missing_key_inside_a_present_global_is_not_a_missing_global(self):
+        # A guard on G['CONFIG']['key'] reports "KeyError on
+        # G['GLOBAL_POOLING_CONFIG']['pooling']" when the KEY is gone but the
+        # global itself resolved, which is an ordinary mismatch: the report keeps
+        # the "Add a ModelInput" advice and withholds the missing-global hint,
+        # whose advice (define the global) is wrong here. The whole-verbose-part
+        # match that tells the two apart came in with the hint and is pinned
+        # there; what this pins is which of the two the module report reaches for.
+        self._hide_leaked_dynamo_globals()
+        mod = GlobalConfigModule()
+        x = torch.randn(4, 8)
+        model = torch.compile(
+            mod,
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        model._aot_compile([ModelInput(args=(x,), kwargs={}, contexts=[])])
+        saved = GLOBAL_POOLING_CONFIG.pop("pooling")
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                model(x)
+            message = str(ctx.exception)
+        finally:
+            GLOBAL_POOLING_CONFIG["pooling"] = saved
+        self.assertIn("[0] KeyError on G['GLOBAL_POOLING_CONFIG']['pooling']", message)
+        self.assertIn("Add a ModelInput", message)
+        self.assertNotIn("a guarded global is missing", message)
+
+    def test_no_match_report_resolves_forward_only_for_a_supplied_scope(self):
+        # An in-process capture keeps the CAPTURED scope, whose hint never names
+        # forward, so the report has no reason to resolve it -- and resolving it
+        # runs user code (get_traced_fn formats a forward it refuses). Since the
+        # CAPTURED wording reads the same whether or not the resolve ran, the
+        # gate is pinned by counting resolves rather than by the wording.
+        self._hide_leaked_dynamo_globals()
+        model = torch.compile(
+            HermeticModule(),
+            fullgraph=True,
+            backend="eager",
+            options={"guard_filter_fn": keep_global_guards},
+        )
+        x = torch.randn(3, 3)
+        model._aot_compile([ModelInput(args=(x,), kwargs={}, contexts=[])])
+        resolve = patch(
+            "torch._dynamo.aot_compile._resolve_guard_scope", wraps=_resolve_guard_scope
+        )
+        g = globals()
+        saved = g.pop("AOT_HERMETIC_WEIGHT")
+        try:
+            with resolve as resolved, self.assertRaises(RuntimeError) as ctx:
+                model(x)
+            message = str(ctx.exception)
+        finally:
+            g["AOT_HERMETIC_WEIGHT"] = saved
+        resolved.assert_not_called()
+        self.assertIn("[0] KeyError on G['AOT_HERMETIC_WEIGHT']", message)
+        self.assertIn("the module the compiled function was traced in", message)
+        self.assertNotIn("instance's forward", message)
+        self.assertIn("Add a ModelInput", message)
 
     def test_no_match_report_survives_a_forward_resolve_that_raises(self):
         # deserialize without guard_globals= resolves the scope itself, so every

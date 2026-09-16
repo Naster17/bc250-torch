@@ -8,6 +8,17 @@
 #include <ATen/native/cpu/Loops.h>
 #include <c10/util/irange.h>
 
+// gcc defaults to -ffp-contract=fast, which fuses the multiply-add in
+// `addr_kernel` even across the rounding `c10::Half`'s operators impose. That
+// drops a rounding step the reference implementations keep, leaving float16 an
+// ulp off on hardware with native fp16. No source-level barrier blocks the
+// fusion -- `beta * self + x` is itself a fusable pair -- so this has to be
+// file-scoped, and float and double give up their fma as a result. clang and
+// MSVC (/fp:strict, see cmake/Codegen.cmake) honour the rounding already.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize("fp-contract=off")
+#endif
+
 namespace at::native { namespace {
 
 void addr_kernel(TensorIterator &iter,
@@ -75,7 +86,15 @@ void addr_kernel(TensorIterator &iter,
           [=](Vec self_vec,
               Vec vec1_vec,
               Vec vec2_vec) __ubsan_ignore_undefined__ {
+            // Must mirror whatever the compiler did to the scalar lambda above:
+            // clang contracts the float and double cases but leaves c10::Half
+            // alone, MSVC contracts nothing under /fp:strict, and gcc contracts
+            // nothing now that the pragma above is in effect.
+#if defined(_MSC_VER) || (defined(__GNUC__) && !defined(__clang__))
             return beta_vec * self_vec + alpha_vec * vec1_vec * vec2_vec;
+#else
+            return vec::fmadd(beta_vec, self_vec, alpha_vec * vec1_vec * vec2_vec);
+#endif
           }
         );
       }

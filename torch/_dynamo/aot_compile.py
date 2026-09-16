@@ -48,6 +48,18 @@ _EXTERNAL_DATA_HINT = (
     "Mark the value(s) as external data by using `external_data={'key': ...}`."
 )
 
+# What a raise can cost the tree it came out of, said once: the no-match report
+# and the warning the serving paths log both name it. Phrased for one tree or
+# several, since the report's caveat names every tree it rests on. Hedged,
+# because only a throw skips the reset on check_nopybind_template's exits: a
+# tree that returns with an error set (the SystemError _unwrapped_raise reads
+# through) reset on its way out, and neither the last-resort veto nor this
+# clause tells the two apart.
+_STALE_AFTER_THROW = (
+    "a C++ throw out of a tree can leave that tree's relational guard state "
+    "stale, so its next check can reject a call it fits or accept one it does not"
+)
+
 
 # A guard failure that is exactly a missing top-level global: the verbose code
 # part a guard tree reports for one ("KeyError on G['CONFIG']"). A trailing
@@ -118,18 +130,21 @@ def _unwrapped_raise(e: Exception) -> tuple[str, BaseException]:
     return type(reason).__name__, reason
 
 
-def _raised_line(index: int, e: Exception) -> str:
+def _raise_text(e: Exception) -> str:
     kind, reason = _unwrapped_raise(e)
     # Keyed on that chain, not on where the raise came from: the clause explains
-    # why the line quotes a chained exception instead of the one the tree
+    # why the text quotes a chained exception instead of the one the tree
     # raised, so a raise with nothing chained -- a TORCH_CHECK inside the tree,
     # which pybind translates at this same boundary into a plain RuntimeError --
-    # gets the line without it.
+    # gets the text without it.
     boundary = "" if reason is e else " (through the guard tree's pybind boundary)"
-    line = f"  [{index}] <guard check raised {kind}: {reason}{boundary}>"
     # str(reason) is arbitrary user text, and the report is one line per input
     # read back with splitlines(), so collapse every separator it breaks on.
-    return " ".join(line.splitlines())
+    return " ".join(f"{kind}: {reason}{boundary}".splitlines())
+
+
+def _raised_line(index: int, e: Exception) -> str:
+    return f"  [{index}] <guard check raised {_raise_text(e)}>"
 
 
 class _GuardScope(enum.Enum):
@@ -1703,11 +1718,13 @@ class AOTCompiledModel:
     whose guards failed on a global the process does not define; and -- when
     some checked tree reached an answer, or the artifact holds no input at all
     -- the advice to add a ``ModelInput`` or check which guards
-    ``guard_filter_fn`` kept. When no checked tree ever answered and some tree
-    raised, a line saying every guard tree raised replaces it, unless an
-    opted-out result's line has already said the raise withheld it. When some
-    checked input's guard tree raised, that exception is the ``__cause__`` of
-    the ``RuntimeError`` rather than the exception the caller sees, so a caller
+    ``guard_filter_fn`` kept. When every rejection that advice rests on followed
+    a raise from its own tree, it names and quotes those raises and says to fix
+    them first; when no checked tree ever answered and some tree raised, a line
+    saying every guard tree raised replaces it, unless an opted-out result's
+    line has already said the raise withheld it. When some checked input's
+    guard tree raised, that exception is the ``__cause__`` of the
+    ``RuntimeError`` rather than the exception the caller sees, so a caller
     catching the tree's own type (``SystemError`` for a leaf that returned with
     an error set, ``RuntimeError`` for a ``TORCH_CHECK``) catches the report
     instead.
@@ -1757,9 +1774,11 @@ class AOTCompiledModel:
         raised: dict[int, Exception] = {}
         # `unanswered` holds the indices whose LAST evaluation reached no answer,
         # the only ones with no guard to quote; `answered` those that ever reached
-        # one, which a ModelInput could have covered.
+        # one, which a ModelInput could have covered; `trusted` those that did so
+        # with no raise of their own on record (see warn_swallowed).
         unanswered: set[int] = set()
         answered: set[int] = set()
+        trusted: set[int] = set()
         # Per-result bindings, filled on first use and kept for the re-check and
         # the report.
         bound: dict[int, dict[str, object]] = {}
@@ -1794,8 +1813,11 @@ class AOTCompiledModel:
             if answer:
                 return True
             # Recorded on a rejection only: an accept serves and builds no report.
+            # Measured 0.06us for the four against a 1.3us check().
             unanswered.discard(i)
             answered.add(i)
+            if i not in raised:
+                trusted.add(i)
             return False
 
         def warn_swallowed(served: int) -> None:
@@ -1818,9 +1840,7 @@ class AOTCompiledModel:
                 if results[i]._guard_check_enabled:
                     advice = (
                         f"Fix or drop input [{i}]: a tree that raises rejects "
-                        "nothing, and a C++ throw out of it leaves its own "
-                        "relational guard state stale, so its next check can "
-                        "reject a call it fits or accept one it does not."
+                        f"nothing, and {_STALE_AFTER_THROW}."
                     )
                 else:
                     # The last resort serves an opted-out result whatever its
@@ -1881,7 +1901,9 @@ class AOTCompiledModel:
                     if raised:
                         warn_swallowed(i)
                     return result._serve(self.model, *args, **kwargs)
-        report = self._no_match_report(results, raised, unanswered, answered, bound)
+        report = self._no_match_report(
+            results, raised, unanswered, answered, trusted, bound
+        )
         if raised:
             # `raised` is in recording order, so this chains the first index that
             # raised, not always the raiser the advice names: they differ when an
@@ -1897,6 +1919,7 @@ class AOTCompiledModel:
         raised: dict[int, Exception],
         unanswered: set[int],
         answered: set[int],
+        trusted: set[int],
         bound: dict[int, dict[str, object]],
     ) -> str:
         """A report naming every compiled input and what its guard check said,
@@ -1924,6 +1947,7 @@ class AOTCompiledModel:
         # An entry that answered in either dispatch pass rejected this call, so a
         # ModelInput could have covered it even where its line below is a raise.
         coverable = any(results[i]._guard_check_enabled for i in answered)
+        trusted_rejection = any(results[i]._guard_check_enabled for i in trusted)
         withheld = False
         for i, result in enumerate(results):
             if not result._guard_check_enabled:
@@ -2004,12 +2028,40 @@ class AOTCompiledModel:
         # An artifact holding no inputs at all -- which deserialize() accepts --
         # has no entry to answer, and adding an input is exactly the advice for it.
         if coverable or not results:
-            lines.append(
+            advice = (
                 "Add a ModelInput covering this call, or check whether "
                 "guard_filter_fn kept a guard this call cannot satisfy -- both "
                 "belong to the process that compiles the artifacts, which need "
                 "not be the one that loaded them."
             )
+            if coverable and not trusted_rejection:
+                # Keyed on what dispatch recorded, not on the entry lines: the
+                # re-check may have printed a raise or an accept instead. Named
+                # and quoted here because nothing else on the report carries
+                # such a raise: the entry line quotes the rejection, the raiser
+                # line names the FIRST enabled raiser, which need not be one of
+                # these, and the chain carries the first raise of all. Bracketed
+                # as on the entry line and joined with a semicolon: the quoted
+                # text is arbitrary user text that may hold commas, and
+                # _raise_text has a parenthetical of its own. `- trusted` is
+                # what makes raised[i] safe to read without the gate above: an
+                # answered entry outside `trusted` raised before it rejected.
+                # Under that gate every trusted entry is opted out, so the
+                # enabled filter alone already drops them; it is there for the
+                # opted-out entries that raised and then rejected, whose guards
+                # nobody asked about and whose withheld line blames the raiser.
+                untrusted = [
+                    f"[{i}] <{_raise_text(raised[i])}>"
+                    for i in sorted(answered - trusted)
+                    if results[i]._guard_check_enabled
+                ]
+                plural = "s" if len(untrusted) > 1 else ""
+                advice += (
+                    f" Fix the raise{plural} out of {'; '.join(untrusted)} first: "
+                    "every rejection this advice rests on followed a raise from "
+                    f"its own tree, and {_STALE_AFTER_THROW}."
+                )
+            lines.append(advice)
         if raised and not withheld and not coverable:
             # Not beside a withheld line, which has already said what happened,
             # and not for the empty artifact, which has no raise to describe.

@@ -1608,10 +1608,16 @@ class AOTCompiledModel:
                     "it here: a guard that does not answer consistently>"
                 )
                 continue
+            if not reason.verbose_code_parts:
+                # A failing accessor can answer false with no parts to quote.
+                lines.append(f"  [{i}] <guard check failed without naming a guard>")
+                continue
             parts = reason.verbose_code_parts
             if any(map(_names_a_missing_global, parts)):
                 hinted.setdefault(result._missing_global_hint(), []).append(i)
-            lines.append(f"  [{i}] {'; '.join(parts)}")
+            # Collapse every separator splitlines() reads the report back on.
+            joined = " ".join("; ".join(parts).splitlines())
+            lines.append(f"  [{i}] {joined}")
         for hint, at in hinted.items():
             lines.append(f"For [{', '.join(map(str, at))}]: {hint}")
         lines.append(

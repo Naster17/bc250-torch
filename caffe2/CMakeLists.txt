@@ -1788,6 +1788,13 @@ if(USE_ROCM)
   # Since PyTorch files contain HIP headers, this is also needed to capture the includes.
   # ROCM_INCLUDE_DIRS is defined in LoadHIP.cmake
   target_include_directories(torch_hip PRIVATE ${Caffe2_HIP_INCLUDE} ${ROCM_INCLUDE_DIRS})
+  if(ROCM_ROCTX_LIB)
+    get_filename_component(_roctx_libdir "${ROCM_ROCTX_LIB}" DIRECTORY)
+    get_filename_component(_roctx_prefix "${_roctx_libdir}" DIRECTORY)
+    if(EXISTS "${_roctx_prefix}/include/roctracer/roctx.h")
+      target_include_directories(torch_hip PRIVATE "${_roctx_prefix}/include")
+    endif()
+  endif()
   target_include_directories(torch_hip INTERFACE $<INSTALL_INTERFACE:include>)
 endif()
 

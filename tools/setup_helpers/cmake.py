@@ -293,6 +293,13 @@ class CMake:
                     "TORCH_XPU_ARCH_LIST",
                     "TRACING_BASED",
                     "PYTHON_LIB_REL_PATH",
+                    "Python_INCLUDE_DIR",
+                    "Python_LIBRARY",
+                    "Python_NumPy_INCLUDE_DIR",
+                    "Python_NumPy_INCLUDE_DIRS",
+                    "Python_ROOT_DIR",
+                    "Python_FIND_VIRTUALENV",
+                    "Python_FIND_STRATEGY",
                 )
             }
         )

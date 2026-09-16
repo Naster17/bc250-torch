@@ -62,6 +62,7 @@ endif()
 # Add ROCM_PATH to CMAKE_PREFIX_PATH, needed because the find_package
 # call to individual ROCM components uses the Config mode search
 list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH})
+set(_BC250_SAVED_PREFIX_PATH "${CMAKE_PREFIX_PATH}")
 
 macro(find_package_and_print_version PACKAGE_NAME)
   find_package("${PACKAGE_NAME}" ${ARGN})
@@ -194,6 +195,19 @@ if(HIP_FOUND)
   if(UNIX)
     # roctx is part of roctracer
     find_library(ROCM_ROCTX_LIB roctx64 HINTS ${ROCM_PATH}/lib)
+    foreach(_roctx_prefix ${_BC250_SAVED_PREFIX_PATH})
+      if(EXISTS "${_roctx_prefix}/include/roctracer/roctx.h")
+        list(APPEND ROCM_INCLUDE_DIRS "${_roctx_prefix}/include")
+        list(REMOVE_DUPLICATES ROCM_INCLUDE_DIRS)
+        if(ROCM_ROCTX_LIB STREQUAL "ROCM_ROCTX_LIB-NOTFOUND")
+          if(EXISTS "${_roctx_prefix}/lib/libroctx64.so")
+            set(ROCM_ROCTX_LIB "${_roctx_prefix}/lib/libroctx64.so")
+          endif()
+        endif()
+        message(STATUS "Found roctx in prefix ${_roctx_prefix}: lib=${ROCM_ROCTX_LIB}")
+        break()
+      endif()
+    endforeach()
 
     set(PROJECT_RANDOM_BINARY_DIR "${PROJECT_BINARY_DIR}")
 

@@ -13,11 +13,9 @@
 #if PY_VERSION_HEX >= 0x03080000
 #define Py_BUILD_CORE
 
-#ifndef __cplusplus
-// C-only headers
+// C-only headers (C++ callers: cpython_defs is compiled LANGUAGE C; see torch/CMakeLists.txt)
 #include <internal/pycore_pystate.h>
 
-#endif // __cplusplus
 
 #if IS_PYTHON_3_11_PLUS
 #include <internal/pycore_frame.h>

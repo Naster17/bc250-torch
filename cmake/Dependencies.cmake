@@ -1039,6 +1039,8 @@ if(USE_ROCM)
 
     # needed for compat with newer versions of hip-clang that introduced C++20 mangling rules
     list(APPEND HIP_HIPCC_FLAGS -fclang-abi-compat=17)
+    # host CXX here is also amdclang++, keep its mangling in sync with HIP host code
+    string(APPEND CMAKE_CXX_FLAGS " -fclang-abi-compat=17")
 
     set(HIP_CLANG_FLAGS ${HIP_CXX_FLAGS})
     # Ask hcc to generate device code during compilation so we can use
@@ -1059,6 +1061,10 @@ if(USE_ROCM)
     # Math libraries
     list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS
       roc::hipblas roc::rocblas hip::hipfft hip::hiprand roc::hipsparse roc::hipsolver roc::hipblaslt roc::rocsolver)
+    # BC-250: hipblaslt package may be headers+lib only; drop the link when absent.
+    if(NOT hipblaslt_FOUND)
+      list(REMOVE_ITEM Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS roc::hipblaslt)
+    endif()
     # hipsparselt is an optional component that will eventually be enabled by default.
     if(hipsparselt_FOUND)
       list(APPEND Caffe2_PUBLIC_HIP_DEPENDENCY_LIBS

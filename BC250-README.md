@@ -122,3 +122,27 @@ git rebase origin/v2.9.1   # or newer tag; re-check the hipblaslt hunk,
                            # upstream refactors this area often
 # rebuild wheel + rerun GEMM/train gates before pushing
 ```
+
+## Distributed variant (Gloo, 2-board TCP training)
+
+Same source, different build flags (`bc250-stack/pytorch/build-torch-dist-gfx1013.sh`):
+
+```sh
+USE_DISTRIBUTED=1 USE_GLOO=1 USE_MPI=0 USE_NCCL=0 USE_RCCL=0
+```
+
+Result: `dist-avail: True, gloo: True, nccl: False`; single-process gloo
+allreduce on `cuda` verified (`DIST_GLOO_OK`). Wheel
+`torch-2.9.1a0+gitunknown` 136,712,418 bytes, sha256
+`2d1af013d1896966c5d09557f3b56592df2e920b5c103098354a8d1aa14ddc5b`.
+
+Two build notes:
+
+- The staged source tree contains a `build/` dir; it must be removed
+  before configure or CMake skips reconfigure on the stale cache (the
+  script does `rm -rf /out/build/pytorch/build` after staging).
+- `torch/csrc/distributed/c10d/symm_mem/` needs `rocm_smi/rocm_smi.h`
+  (headers: board `/usr/local/include`) and `librocm_smi64.so` at
+  runtime (Ubuntu deb `rocm-smi-lib`, see `bc250-stack` rocm-smi prefix).
+  `libtorch_hip.so` carries the `rsmi_*` symbols as undefined, resolved
+  via preload/LD path — no source change needed.

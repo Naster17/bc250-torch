@@ -13,7 +13,9 @@
 #if PY_VERSION_HEX >= 0x03080000
 #define Py_BUILD_CORE
 
-// C-only headers (C++ callers: cpython_defs is compiled LANGUAGE C; see torch/CMakeLists.txt)
+// C-only headers (C++ callers: cpython_defs is compiled LANGUAGE C; see torch/CMakeLists.txt).
+// Validated against Python 3.12.3; re-check C++ parseability of CPython
+// internals when moving to a newer minor (see python/cpython#105268).
 #include <internal/pycore_pystate.h>
 
 

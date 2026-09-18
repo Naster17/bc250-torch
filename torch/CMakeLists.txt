@@ -331,7 +331,7 @@ if(USE_ROCM)
   set_source_files_properties(
     ${TORCH_SRC_DIR}/csrc/dynamo/cpython_defs.c
     ${TORCH_SRC_DIR}/csrc/dynamo/eval_frame.c
-    PROPERTIES LANGUAGE C COMPILE_FLAGS "-std=gnu11 -fno-strict-aliasing -Wno-strict-aliasing")
+    PROPERTIES LANGUAGE C COMPILE_OPTIONS "-std=gnu11;-fno-strict-aliasing;-Wno-strict-aliasing")
 endif()
 if(APPLE)
   target_compile_options(torch_python PRIVATE

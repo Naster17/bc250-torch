@@ -28,8 +28,9 @@
 #endif
 
 #if defined(USE_ROCM)
-#include <miopen/version.h>
 #include <hipblaslt/hipblaslt-version.h>
+#include <hipblaslt/hipblaslt.h>
+#include <miopen/version.h>
 #endif
 
 #ifndef USE_ROCM
@@ -567,18 +568,86 @@ const std::vector<std::string>& CUDAHooks::getHipblasltPreferredArchs() const {
 }
 
 const std::vector<std::string>& CUDAHooks::getHipblasltSupportedArchs() const {
-  static const std::vector<std::string> archs = {
-    "gfx90a", "gfx942",
+  static const std::vector<std::string> archs = [this]() {
+    std::vector<std::string> supported = {
+        "gfx90a",
+        "gfx942",
 #if ROCM_VERSION >= 60300
-    "gfx1100", "gfx1101", "gfx1103", "gfx1200", "gfx1201", "gfx908",
+        "gfx1100",
+        "gfx1101",
+        "gfx1103",
+        "gfx1200",
+        "gfx1201",
+        "gfx908",
 #endif
 #if ROCM_VERSION >= 70000
-    "gfx950", "gfx1150", "gfx1151",
+        "gfx950",
+        "gfx1150",
+        "gfx1151",
 #endif
 #if ROCM_VERSION >= 71400
-    "gfx1250"
+        "gfx1250"
 #endif
-  };
+    };
+    // gfx1013 support is supplied by an optional scalar backend. A ROCm version
+    // alone does not identify it: query the linked library before allowing an
+    // explicit cuBLASLt preference. Keep the default rocBLAS preference intact.
+    for (auto index : c10::irange(deviceCount())) {
+      const std::string device_arch = getDeviceProperties(index)->gcnArchName;
+      if (device_arch.substr(0, device_arch.find(':')) != "gfx1013") {
+        continue;
+      }
+      at::DeviceGuard guard(at::Device(at::DeviceType::CUDA, index));
+      hipblasLtHandle_t handle = nullptr;
+      hipblasLtMatmulDesc_t desc = nullptr;
+      hipblasLtMatrixLayout_t layout = nullptr;
+      hipblasLtMatmulPreference_t preference = nullptr;
+      auto status = hipblasLtCreate(&handle);
+      if (status == HIPBLAS_STATUS_SUCCESS) {
+        status =
+            hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F);
+      }
+      if (status == HIPBLAS_STATUS_SUCCESS) {
+        status = hipblasLtMatrixLayoutCreate(&layout, HIP_R_32F, 1, 1, 1);
+      }
+      if (status == HIPBLAS_STATUS_SUCCESS) {
+        status = hipblasLtMatmulPreferenceCreate(&preference);
+      }
+      hipblasLtMatmulHeuristicResult_t result{};
+      int count = 0;
+      if (status == HIPBLAS_STATUS_SUCCESS) {
+        status = hipblasLtMatmulAlgoGetHeuristic(
+            handle,
+            desc,
+            layout,
+            layout,
+            layout,
+            layout,
+            preference,
+            1,
+            &result,
+            &count);
+      }
+      if (preference) {
+        hipblasLtMatmulPreferenceDestroy(preference);
+      }
+      if (layout) {
+        hipblasLtMatrixLayoutDestroy(layout);
+      }
+      if (desc) {
+        hipblasLtMatmulDescDestroy(desc);
+      }
+      if (handle) {
+        hipblasLtDestroy(handle);
+      }
+      if (status == HIPBLAS_STATUS_SUCCESS && count == 1 &&
+          result.state == HIPBLAS_STATUS_SUCCESS && result.workspaceSize == 0) {
+        supported.emplace_back("gfx1013");
+      }
+      break;
+    }
+    return supported;
+  }();
   return archs;
 }
 #endif

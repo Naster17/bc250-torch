@@ -316,7 +316,7 @@ def _warn_tf32_disabled() -> None:
     if (
         torch.cuda.is_available()
         and torch.backends.cuda.matmul.fp32_precision != "tf32"
-        and torch.cuda.get_device_capability() >= (8, 0)
+        and torch.cuda.is_tf32_supported()
     ):
         warnings.warn(
             "TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. "

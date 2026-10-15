@@ -192,15 +192,26 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     Unsupported options raise; this function never silently falls back. Importing
     it does not change functional SDPA, build capabilities, or backend flags.
     No higher-order gradients, torch.compile, CUDA graphs, or dropout support is
-    claimed. Autocast callers must supply Q/K/V in their desired common dtype.
+    claimed. CUDA autocast casts eligible floating inputs to its target dtype,
+    as functional SDPA does, while preserving gradients through those casts.
     """
     if torch.compiler.is_compiling():
         raise NotImplementedError("gfx1013 tiled SDPA currently supports eager only")
     tensors = (query, key, value)
     if any(t.layout != torch.strided or t.ndim != 4 for t in tensors):
         raise ValueError("Expected strided [B,H,L,D] Q/K/V")
-    if any(t.device != query.device or t.dtype != query.dtype for t in tensors):
-        raise ValueError("Q/K/V must share device and dtype")
+    if any(t.device != query.device for t in tensors):
+        raise ValueError("Q/K/V must share device")
+    if torch.is_autocast_enabled("cuda") and all(
+            t.dtype in (torch.float32, torch.float16, torch.bfloat16) for t in tensors):
+        target = torch.get_autocast_dtype("cuda")
+        tensors = tuple(t.to(target) for t in tensors)
+        query, key, value = tensors
+        if attn_mask is not None and attn_mask.dtype in (
+                torch.float32, torch.float16, torch.bfloat16):
+            attn_mask = attn_mask.to(target)
+    if any(t.dtype != query.dtype for t in tensors):
+        raise ValueError("Q/K/V must share dtype outside autocast")
     if query.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         raise ValueError("Only FP32/FP16/BF16 Q/K/V are supported")
     if query.device.type != "cuda" or not torch.version.hip:

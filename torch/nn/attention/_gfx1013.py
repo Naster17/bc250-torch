@@ -48,7 +48,9 @@ def _forward(Q, K, V, Mask, O, LSE, M: tl.constexpr, N: tl.constexpr,
     maximum = -float("inf")
     normalizer = 0.0
     acc = tl.full((BD,), 0, tl.float32)
-    for start in range(tl.cdiv(N, T)):
+    # Upper-left causal attention cannot read keys beyond this query row.
+    end = tl.minimum(N, row + 1) if CAUSAL else N
+    for start in range(tl.cdiv(end, T)):
         cols = start*T + tl.arange(0, T)
         k = tl.load(K + ((b*HK+kh)*N + cols[:, None])*D + d[None, :],
                     (cols[:, None] < N) & (d[None, :] < D), 0).to(tl.float32)
@@ -87,7 +89,8 @@ def _backward_q(Q, K, V, Mask, O, LSE, DO, DQ, M: tl.constexpr, N: tl.constexpr,
     delta = tl.sum(go*o, 0)
     lse = tl.load(LSE+bh*M+row)
     acc = tl.full((BD,), 0, tl.float32)
-    for start in range(tl.cdiv(N, T)):
+    end = tl.minimum(N, row + 1) if CAUSAL else N
+    for start in range(tl.cdiv(end, T)):
         cols = start*T + tl.arange(0, T)
         offsets = ((b*HK+kh)*N+cols[:, None])*D+d[None, :]
         valid = (cols[:, None] < N) & (d[None, :] < D)
@@ -121,7 +124,10 @@ def _backward_kv(Q, K, V, Mask, O, LSE, DO, DK, DV,
     for group in range(H // HK):
         h = kh*(H // HK)+group
         bh = b*H+h
-        for start in range(tl.cdiv(M, T)):
+        # This key contributes only to query rows >=col. Keep the boundary
+        # tile masked; keys beyond all query rows naturally produce zero.
+        first = col // T if CAUSAL else 0
+        for start in range(first, tl.cdiv(M, T)):
             rows = start*T + tl.arange(0, T)
             offsets = (bh*M+rows[:, None])*D+d[None, :]
             valid = (rows[:, None] < M) & (d[None, :] < D)
@@ -153,7 +159,7 @@ class _Attention(torch.autograd.Function):
         strides = mask.stride() if mask.numel() else (0, 0, 0, 0)
         params = (m, n, h, hk, d, *strides, scale,
                   mask.numel() > 0, mask.dtype == torch.bool, causal,
-                  triton.next_power_of_2(d), 16)
+                  triton.next_power_of_2(d), 32 if causal and d >= 64 else 16)
         with torch.cuda.device(q.device):
             if b*h*m:
                 _forward[(m, b*h)](q, k, v, mask, o, lse, *params, num_warps=4)

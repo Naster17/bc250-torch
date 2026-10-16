@@ -1,12 +1,16 @@
 #include <torch/csrc/utils/pybind.h>
 
-#ifdef USE_CUSPARSELT
+#if defined(USE_CUSPARSELT) || defined(USE_HIPSPARSELT)
 #include <ATen/native/sparse/cuda/cuSPARSELtOps.h>
 
 namespace {
 
 size_t getVersionInt() {
+#ifdef USE_ROCM
+  return hipsparseltVersionMajor * 100000 + hipsparseltVersionMinor * 100 + hipsparseltVersionPatch;
+#else
   return CUSPARSELT_VERSION;
+#endif
 }
 
 std::tuple<int64_t, int64_t, int64_t, int64_t> mmSearch(

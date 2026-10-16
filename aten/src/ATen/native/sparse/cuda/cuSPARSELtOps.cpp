@@ -27,9 +27,9 @@ static bool g_hipSparseLtSupported = false;
 
 static const std::vector<std::string>& hipSparseLtSupportedArchs() {
 #if ROCM_VERSION >= 71400
-  static const std::vector<std::string> archs = {"gfx950", "gfx942", "gfx1250"};
+  static const std::vector<std::string> archs = {"gfx950", "gfx942", "gfx1250", "gfx1013"};
 #elif ROCM_VERSION >= 71200
-  static const std::vector<std::string> archs = {"gfx950", "gfx942"};
+  static const std::vector<std::string> archs = {"gfx950", "gfx942", "gfx1013"};
 #else
   static const std::vector<std::string> archs = {};
 #endif
@@ -73,7 +73,23 @@ static bool isHipSparseLtSupported() {
 }
 #endif
 
+static bool usesGfx1013ScalarSparseLt() {
+#ifdef USE_ROCM
+  const std::string_view arch(at::cuda::getCurrentDeviceProperties()->gcnArchName);
+  return arch == "gfx1013" || arch.substr(0, 8) == "gfx1013:";
+#else
+  return false;
+#endif
+}
+
 at::Tensor _cslt_compress(const Tensor& sparse_input) {
+  const bool native_gfx1013 = usesGfx1013ScalarSparseLt();
+  if (native_gfx1013) {
+    TORCH_CHECK(sparse_input.is_cuda() && sparse_input.dim() == 2 &&
+        sparse_input.is_contiguous(), "gfx1013 sparse compression requires a contiguous GPU matrix");
+    TORCH_CHECK(sparse_input.size(0) > 0 && sparse_input.size(1) > 0,
+        "gfx1013 sparse compression requires nonempty dimensions");
+  }
   if (!handle_initialized) {
     TORCH_CUDASPARSE_CHECK(cusparseLtInit(&handle));
     handle_initialized = true;
@@ -96,11 +112,12 @@ at::Tensor _cslt_compress(const Tensor& sparse_input) {
     case at::ScalarType::BFloat16:
       type = CUDA_R_16BF;
       break;
-#ifndef USE_ROCM
     case at::ScalarType::Float:
+#ifdef USE_ROCM
+      TORCH_CHECK(native_gfx1013, "FP32 hipSPARSELt compression requires the native gfx1013 scalar backend");
+#endif
       type = CUDA_R_32F;
       break;
-#endif
 #if defined(CUSPARSELT_VERSION) && CUSPARSELT_VERSION >= 602 || defined(USE_ROCM)
     case at::ScalarType::Float8_e4m3fn:
       type = CUDA_R_8F_E4M3;
@@ -168,6 +185,35 @@ std::tuple<at::Tensor, int64_t, int64_t, int64_t, int64_t> _cslt_sparse_mm_impl(
     int split_k,
     int split_k_mode,
     bool search_alg_id) {
+  const bool native_gfx1013 = usesGfx1013ScalarSparseLt();
+  if (native_gfx1013) {
+    TORCH_CHECK(compressed_A.is_cuda() && dense_B.is_cuda() &&
+        compressed_A.device() == dense_B.device(), "gfx1013 sparse matmul inputs must share a GPU");
+    TORCH_CHECK(compressed_A.dim() == 2 && compressed_A.is_contiguous() &&
+        dense_B.dim() == 2 && (dense_B.is_contiguous() || dense_B.t().is_contiguous()),
+        "gfx1013 sparse matmul requires a contiguous pack and row/column-contiguous dense matrix");
+    TORCH_CHECK(compressed_A.scalar_type() == dense_B.scalar_type(),
+        "gfx1013 sparse matmul input dtypes must match");
+    TORCH_CHECK(compressed_A.size(0) > 0 && dense_B.size(0) > 0 && dense_B.size(1) > 0,
+        "gfx1013 sparse matmul requires nonempty dimensions");
+    TORCH_CHECK(!out_dtype_opt.has_value(),
+        "gfx1013 scalar hipSPARSELt supports same-dtype output only; omit out_dtype");
+    if (bias_opt.has_value()) {
+      const auto& bias = *bias_opt;
+      TORCH_CHECK(bias.is_cuda() && bias.device() == dense_B.device() &&
+          bias.dim() == 1 && bias.numel() == compressed_A.size(0) && bias.is_contiguous(),
+          "gfx1013 sparse bias must be a contiguous GPU vector with one value per row");
+      TORCH_CHECK(bias.scalar_type() == at::kFloat ||
+          (dense_B.scalar_type() != at::kChar && bias.scalar_type() == dense_B.scalar_type()),
+          "gfx1013 sparse bias must be FP32 or match the floating input dtype");
+    }
+    if (alpha_opt.has_value() && alpha_opt->numel() != 1) {
+      TORCH_CHECK(alpha_opt->is_cuda() && alpha_opt->device() == dense_B.device() &&
+          alpha_opt->scalar_type() == at::kFloat && alpha_opt->is_contiguous() &&
+          alpha_opt->dim() == 1 && alpha_opt->numel() == compressed_A.size(0),
+          "gfx1013 sparse alpha must be a scalar or a contiguous FP32 GPU vector with one value per row");
+    }
+  }
   if (!handle_initialized) {
     TORCH_CUDASPARSE_CHECK(cusparseLtInit(&handle));
     handle_initialized = true;
@@ -212,14 +258,15 @@ std::tuple<at::Tensor, int64_t, int64_t, int64_t, int64_t> _cslt_sparse_mm_impl(
       C_type = CUDA_R_16BF;
       compute_type = CUSPARSE_COMPUTE_32F;
       break;
-#ifndef USE_ROCM
     case at::ScalarType::Float:
+#ifdef USE_ROCM
+      TORCH_CHECK(native_gfx1013, "FP32 hipSPARSELt matmul requires the native gfx1013 scalar backend");
+#endif
       input_type = CUDA_R_32F;
       output_type = CUDA_R_32F;
       C_type = CUDA_R_32F;
       compute_type = CUSPARSE_COMPUTE_32F;
       break;
-#endif
 // cuSPARSELt >= 0.6.2 or hipSparseLt: add Float8 support
 #if defined(CUSPARSELT_VERSION) && CUSPARSELT_VERSION >= 602 || defined(USE_ROCM)
     case at::ScalarType::Float8_e4m3fn:
@@ -265,7 +312,7 @@ std::tuple<at::Tensor, int64_t, int64_t, int64_t, int64_t> _cslt_sparse_mm_impl(
   ScalarType out_dtype = dense_B.scalar_type();
   // special check for mixed dtype support for 8 bit dtypes
   // cslt 0.5.2+: int8 int8 -> {fp16, bf16, int32} support
-  if (out_dtype_opt.has_value()) {
+  if (out_dtype_opt.has_value() && !native_gfx1013) {
     out_dtype = out_dtype_opt.value();
     if (input_type == CUDA_R_8I) {
       switch (out_dtype) {
@@ -346,6 +393,15 @@ std::tuple<at::Tensor, int64_t, int64_t, int64_t, int64_t> _cslt_sparse_mm_impl(
       CUSPARSE_ORDER_ROW,
       CUSPARSELT_SPARSITY_50_PERCENT));
 
+  if (native_gfx1013) {
+    size_t bytes, scratch;
+    TORCH_CUDASPARSE_CHECK(cusparseLtSpMMACompressedSize2(
+        &handle, &sparse_input_descriptor, &bytes, &scratch));
+    const auto row_bytes = m * compressed_A.itemsize();
+    TORCH_CHECK(compressed_A.size(1) == (bytes + row_bytes - 1) / row_bytes,
+        "gfx1013 compressed shape does not match the dense contraction dimension");
+  }
+
   // initialize dense input descriptor
   cusparseLtMatDescriptor_t dense_input_descriptor;
   TORCH_CUDASPARSE_CHECK(cusparseLtDenseDescriptorInit(
@@ -404,6 +460,13 @@ std::tuple<at::Tensor, int64_t, int64_t, int64_t, int64_t> _cslt_sparse_mm_impl(
   if (bias_opt.has_value()) {
     auto& bias = bias_opt.value();
     void* dBias = bias.data_ptr();
+#ifdef USE_ROCM
+    if (native_gfx1013) {
+      hipDataType bias_type = bias.scalar_type() == at::kFloat ? HIP_R_32F : input_type;
+      TORCH_CUDASPARSE_CHECK(cusparseLtMatmulDescSetAttribute(
+          &handle, &matmul, HIPSPARSELT_MATMUL_BIAS_TYPE, &bias_type, sizeof(bias_type)));
+    }
+#endif
     TORCH_CUDASPARSE_CHECK(cusparseLtMatmulDescSetAttribute(
         &handle,
         &matmul,
@@ -423,8 +486,8 @@ std::tuple<at::Tensor, int64_t, int64_t, int64_t, int64_t> _cslt_sparse_mm_impl(
       &alg_id,
       sizeof(alg_id)));
 
-  cusparseLtSplitKMode_t splitKMode;
-  int max_alg_id;
+  cusparseLtSplitKMode_t splitKMode = static_cast<cusparseLtSplitKMode_t>(0);
+  int max_alg_id = 0;
   if (split_k != 1) {
     TORCH_CUDASPARSE_CHECK(cusparseLtMatmulAlgSetAttribute(
         &handle,

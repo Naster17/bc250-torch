@@ -195,8 +195,16 @@ if(USE_CUDNN OR USE_ROCM)
     endif()
 endif()
 
-if(USE_CUSPARSELT)
+if(USE_CUSPARSELT OR (USE_ROCM AND CAFFE2_USE_HIPSPARSELT))
     list(APPEND TORCH_PYTHON_SRCS ${TORCH_SRC_DIR}/csrc/cuda/shared/cusparselt.cpp)
+endif()
+if(USE_ROCM AND CAFFE2_USE_HIPSPARSELT)
+    list(APPEND TORCH_PYTHON_LINK_LIBRARIES roc::hipsparselt)
+    set_property(SOURCE
+        ${TORCH_SRC_DIR}/csrc/Module.cpp
+        ${TORCH_SRC_DIR}/csrc/cuda/Module.cpp
+        ${TORCH_SRC_DIR}/csrc/cuda/shared/cusparselt.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS USE_HIPSPARSELT)
 endif()
 
 if(USE_MPS)

@@ -3285,3 +3285,9 @@
 - name: _foreach_mm(Tensor[] self, Tensor[] mat2) -> Tensor[]
   self: mm_mat1_backward(grads[i], mat2[i], self[i].sym_sizes(), self[i].sym_strides(), self[i].layout(), 1)
   mat2: mm_mat2_backward(grads[i], self[i], mat2[i].sym_sizes(), mat2[i].sym_strides(), mat2[i].layout(), 1)
+
+- name: _cslt_compress(Tensor input) -> Tensor
+  input: _cslt_compress_backward(grad, result, input.sym_size(1).expect_int())
+
+- name: _cslt_sparse_mm(Tensor compressed_A, Tensor dense_B, Tensor? bias=None, Tensor? alpha=None, ScalarType? out_dtype=None, bool transpose_result=False, int alg_id=0, int split_k=1, int split_k_mode=-1) -> Tensor
+  compressed_A, dense_B, bias, alpha: _cslt_sparse_mm_backward(grad, compressed_A, dense_B, bias, alpha, transpose_result, grad_input_mask)

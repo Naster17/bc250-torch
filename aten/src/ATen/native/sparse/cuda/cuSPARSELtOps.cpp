@@ -82,6 +82,80 @@ static bool usesGfx1013ScalarSparseLt() {
 #endif
 }
 
+// Native packs store retained values followed by byte-sized 1:2/2:4 indices.
+static std::tuple<Tensor, Tensor> unpackGfx1013(const Tensor& packed, int64_t k) {
+  TORCH_CHECK(usesGfx1013ScalarSparseLt(), "Sparse Lt backward/unpacking requires gfx1013");
+  TORCH_CHECK(packed.dim() == 2 && packed.is_contiguous() && k > 0,
+      "Invalid native sparse pack");
+  const auto dtype = packed.scalar_type();
+  TORCH_CHECK(dtype == kFloat || dtype == kHalf || dtype == kBFloat16,
+      "Sparse Lt backward/unpacking requires floating-point storage");
+  const int64_t group = dtype == kFloat ? 2 : 4;
+  TORCH_CHECK(k % group == 0, "Invalid native sparse contraction size");
+  const auto m = packed.size(0), groups = k / group, kept = group / 2;
+  const auto value_count = m * k / 2;
+  auto raw = packed.view(kByte).flatten();
+  TORCH_CHECK(raw.numel() >= value_count * packed.itemsize() + m * groups,
+      "Native sparse pack is too small");
+  auto tags = raw.narrow(0, value_count * packed.itemsize(), m * groups)
+                  .to(kLong).view({m, groups, 1});
+  auto shifts = at::arange(kept, packed.options().dtype(kLong)).mul(2);
+  auto indices = at::bitwise_and(at::bitwise_right_shift(tags, shifts), 3);
+  TORCH_CHECK(indices.lt(group).all().item<bool>(), "Invalid native sparse metadata");
+  return {packed.flatten().narrow(0, 0, value_count).view({m, groups, kept}), indices};
+}
+
+Tensor _cslt_to_dense(const Tensor& packed, int64_t k) {
+  auto [values, indices] = unpackGfx1013(packed, k);
+  const int64_t m = packed.size(0), group = packed.scalar_type() == kFloat ? 2 : 4;
+  return at::zeros({m, k / group, group}, packed.options())
+      .scatter(2, indices, values).view({m, k});
+}
+
+Tensor _cslt_compress_backward(const Tensor& grad, const Tensor& packed, int64_t k) {
+  auto [values, indices] = unpackGfx1013(packed, k);
+  const int64_t m = packed.size(0), group = packed.scalar_type() == kFloat ? 2 : 4;
+  auto retained_grad = grad.flatten().narrow(0, 0, m * k / 2).view(values.sizes());
+  return at::zeros({m, k / group, group}, packed.options())
+      .scatter(2, indices, retained_grad).view({m, k});
+}
+
+std::tuple<Tensor, Tensor, Tensor, Tensor> _cslt_sparse_mm_backward(
+    const Tensor& grad, const Tensor& packed, const Tensor& dense,
+    const std::optional<Tensor>& bias, const std::optional<Tensor>& alpha,
+    bool transpose_result, std::array<bool, 4> output_mask) {
+  auto a = at::native::_cslt_to_dense(packed, dense.size(0)).to(kFloat);
+  auto b = dense.to(kFloat);
+  auto g = (transpose_result ? grad.t() : grad).to(kFloat);
+  const bool has_alpha = alpha.has_value() && alpha->defined();
+  const bool has_bias = bias.has_value() && bias->defined();
+  auto scaled = has_alpha
+      ? g.mul(alpha->numel() == 1 ? alpha->to(kFloat) : alpha->to(kFloat).view({-1, 1}))
+      : g;
+  Tensor dp, db, dbias, dalpha;
+  if (output_mask[0]) {
+    auto da = at::mm(scaled, b.t());
+    auto [values, indices] = unpackGfx1013(packed, dense.size(0));
+    const auto group = packed.scalar_type() == kFloat ? 2 : 4;
+    auto retained = da.view({packed.size(0), dense.size(0) / group, group})
+                        .gather(2, indices).to(packed.scalar_type());
+    dp = at::zeros_like(packed);
+    dp.flatten().narrow(0, 0, retained.numel()).copy_(retained.flatten());
+  }
+  if (output_mask[1]) {
+    db = at::mm(a.t(), scaled).to(dense.scalar_type());
+  }
+  if (output_mask[2] && has_bias) {
+    dbias = g.sum(1).to(bias->scalar_type());
+  }
+  if (output_mask[3] && has_alpha) {
+    auto product = g.mul(at::mm(a, b));
+    dalpha = (alpha->numel() == 1 ? product.sum() : product.sum(1))
+                 .to(alpha->scalar_type()).view(alpha->sizes());
+  }
+  return {dp, db, dbias, dalpha};
+}
+
 at::Tensor _cslt_compress(const Tensor& sparse_input) {
   const bool native_gfx1013 = usesGfx1013ScalarSparseLt();
   if (native_gfx1013) {
@@ -673,6 +747,18 @@ int64_t _cslt_sparse_mm_search(
 #else // No cuSPARSELt support, throw error if these functions are called.
 
 namespace at::native {
+
+Tensor _cslt_to_dense(const Tensor&, int64_t) {
+  TORCH_CHECK(false, "cuSPARSELt not supported on your machine.");
+}
+Tensor _cslt_compress_backward(const Tensor&, const Tensor&, int64_t) {
+  TORCH_CHECK(false, "cuSPARSELt not supported on your machine.");
+}
+std::tuple<Tensor, Tensor, Tensor, Tensor> _cslt_sparse_mm_backward(
+    const Tensor&, const Tensor&, const Tensor&, const std::optional<Tensor>&,
+    const std::optional<Tensor>&, bool, std::array<bool, 4>) {
+  TORCH_CHECK(false, "cuSPARSELt not supported on your machine.");
+}
 
 at::Tensor _cslt_compress(const Tensor& sparse_input) {
   TORCH_CHECK(false, "cuSPARSELt not supported on your machine.");

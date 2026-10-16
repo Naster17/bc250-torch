@@ -3332,6 +3332,18 @@
     CUDA: _cslt_sparse_mm
   tags: needs_fixed_stride_order
 
+- func: _cslt_to_dense(Tensor packed, int k) -> Tensor
+  dispatch:
+    CUDA: _cslt_to_dense
+
+- func: _cslt_compress_backward(Tensor grad, Tensor packed, int k) -> Tensor
+  dispatch:
+    CUDA: _cslt_compress_backward
+
+- func: _cslt_sparse_mm_backward(Tensor grad, Tensor compressed_A, Tensor dense_B, Tensor? bias, Tensor? alpha, bool transpose_result, bool[4] output_mask) -> (Tensor, Tensor, Tensor, Tensor)
+  dispatch:
+    CUDA: _cslt_sparse_mm_backward
+
 - func: _cslt_sparse_mm_search(Tensor compressed_A, Tensor dense_B, Tensor? bias=None, Tensor? alpha=None, ScalarType? out_dtype=None, bool transpose_result=False) -> int
   dispatch:
     CUDA: _cslt_sparse_mm_search

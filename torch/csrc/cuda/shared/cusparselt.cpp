@@ -7,7 +7,8 @@ namespace {
 
 size_t getVersionInt() {
 #ifdef USE_ROCM
-  return hipsparseltVersionMajor * 100000 + hipsparseltVersionMinor * 100 + hipsparseltVersionPatch;
+  return hipsparseltVersionMajor * 100000 + hipsparseltVersionMinor * 100 +
+      hipsparseltVersionPatch;
 #else
   return CUSPARSELT_VERSION;
 #endif

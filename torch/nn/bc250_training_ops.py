@@ -8,17 +8,20 @@ No fused gated-delta/FLA implementation, graph or higher-order gradient contract
 
 import functools
 
+import triton
+import triton.language as tl
+
 import torch
 import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
-import triton
-import triton.language as tl
 
 
 @functools.lru_cache(None)
 def _native(device: torch.device) -> bool:
     return (
-        getattr(torch.cuda.get_device_properties(device), "gcnArchName", "").split(":")[0]
+        getattr(torch.cuda.get_device_properties(device), "gcnArchName", "").split(":")[
+            0
+        ]
         == "gfx1013"
     )
 
@@ -104,10 +107,22 @@ def _conv_dx(
 
 
 @triton.jit
-def _conv_dparams(X, G, Z, P, L: tl.constexpr, BL: tl.constexpr,
-                  C: tl.constexpr, XB: tl.constexpr, XC: tl.constexpr,
-                  XT: tl.constexpr, K: tl.constexpr, TILES: tl.constexpr,
-                  ACT: tl.constexpr, BLOCK: tl.constexpr):
+def _conv_dparams(
+    X,
+    G,
+    Z,
+    P,
+    L: tl.constexpr,
+    BL: tl.constexpr,
+    C: tl.constexpr,
+    XB: tl.constexpr,
+    XC: tl.constexpr,
+    XT: tl.constexpr,
+    K: tl.constexpr,
+    TILES: tl.constexpr,
+    ACT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     c, tap, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     index = tile * BLOCK + tl.arange(0, BLOCK)
     b, t = index // L, index % L
@@ -116,22 +131,27 @@ def _conv_dparams(X, G, Z, P, L: tl.constexpr, BL: tl.constexpr,
     if ACT:
         z = tl.load(Z + offset, index < BL, other=0).to(tl.float32)
         sigmoid = tl.sigmoid(z)
-        g = (g * sigmoid * (1 + z * (1 - sigmoid))).to(G.dtype.element_ty).to(tl.float32)
+        g = (
+            (g * sigmoid * (1 + z * (1 - sigmoid)))
+            .to(G.dtype.element_ty)
+            .to(tl.float32)
+        )
     if tap < K:
         source = t + tap - (K - 1)
-        x = tl.load(X + b * XB + c * XC + source * XT,
-                    (index < BL) & (source >= 0), other=0).to(tl.float32)
+        x = tl.load(
+            X + b * XB + c * XC + source * XT, (index < BL) & (source >= 0), other=0
+        ).to(tl.float32)
         g = g * x
     tl.store(P + (c * (K + 1) + tap) * TILES + tile, tl.sum(g, 0))
 
 
 @triton.jit
-def _conv_dparams_reduce(P, DW, DB, K: tl.constexpr, TILES: tl.constexpr,
-                         BLOCK: tl.constexpr):
+def _conv_dparams_reduce(
+    P, DW, DB, K: tl.constexpr, TILES: tl.constexpr, BLOCK: tl.constexpr
+):
     c, tap = tl.program_id(0), tl.program_id(1)
     i = tl.arange(0, BLOCK)
-    value = tl.sum(tl.load(P + (c * (K + 1) + tap) * TILES + i,
-                           i < TILES, other=0), 0)
+    value = tl.sum(tl.load(P + (c * (K + 1) + tap) * TILES + i, i < TILES, other=0), 0)
     if tap < K:
         tl.store(DW + c * K + tap, value)
     else:
@@ -160,7 +180,7 @@ class _CausalConv(torch.autograd.Function):
             activation,
             256,
             num_warps=4,
-            enable_fp_fusion=False
+            enable_fp_fusion=False,
         )
         ctx.save_for_backward(x, w, z)
         ctx.has_bias = b is not None
@@ -188,7 +208,7 @@ class _CausalConv(torch.autograd.Function):
                 ctx.activation,
                 256,
                 num_warps=4,
-                enable_fp_fusion=False
+                enable_fp_fusion=False,
             )
         dw = db = None
         if ctx.needs_input_grad[1] or (ctx.has_bias and ctx.needs_input_grad[2]):
@@ -196,17 +216,36 @@ class _CausalConv(torch.autograd.Function):
             # Fixed partial reductions avoid floating-point atomic accumulation.
             partial = torch.empty(
                 (w.shape[0], w.shape[1] + 1, tiles),
-                device=x.device, dtype=torch.float32,
+                device=x.device,
+                dtype=torch.float32,
             )
             dw = torch.empty(w.shape, device=w.device, dtype=w.dtype)
             db = torch.empty((w.shape[0],), device=w.device, dtype=w.dtype)
             _conv_dparams[(w.shape[0], w.shape[1] + 1, tiles)](
-                x, g, z, partial, x.shape[2], x.shape[0] * x.shape[2],
-                x.shape[1], *x.stride(), w.shape[1], tiles, ctx.activation,
-                512, num_warps=4, enable_fp_fusion=False)
+                x,
+                g,
+                z,
+                partial,
+                x.shape[2],
+                x.shape[0] * x.shape[2],
+                x.shape[1],
+                *x.stride(),
+                w.shape[1],
+                tiles,
+                ctx.activation,
+                512,
+                num_warps=4,
+                enable_fp_fusion=False,
+            )
             _conv_dparams_reduce[(w.shape[0], w.shape[1] + 1)](
-                partial, dw, db, w.shape[1], tiles,
-                triton.next_power_of_2(tiles), num_warps=4)
+                partial,
+                dw,
+                db,
+                w.shape[1],
+                tiles,
+                triton.next_power_of_2(tiles),
+                num_warps=4,
+            )
         return dx, dw, db if ctx.has_bias else None, None
 
 
@@ -229,9 +268,7 @@ def supports_causal_conv(
         and (
             b is None
             or (
-                b.device == x.device
-                and b.dtype == x.dtype
-                and b.shape == (x.shape[1],)
+                b.device == x.device and b.dtype == x.dtype and b.shape == (x.shape[1],)
             )
         )
         and activation in (None, "silu", "swish")
@@ -255,8 +292,9 @@ def causal_conv(x, w, b=None, activation=None):
             b = b.to(dtype)
     if supports_causal_conv(x, w, b, activation):
         return _CausalConv.apply(x, w, b, activation is not None)
-    y = F.conv1d(x, w.unsqueeze(1), b, padding=w.shape[1] - 1,
-                 groups=x.shape[1])[..., :x.shape[2]]
+    y = F.conv1d(x, w.unsqueeze(1), b, padding=w.shape[1] - 1, groups=x.shape[1])[
+        ..., : x.shape[2]
+    ]
     return F.silu(y) if activation is not None else y
 
 
@@ -314,7 +352,9 @@ def chunked_causal_loss(
     Full input logits and their gradient remain allocated.
     """
     if logits.ndim < 2 or logits.shape[-1] < 1 or not logits.is_contiguous():
-        raise ValueError("Chunked loss requires contiguous logits with token and vocabulary dimensions")
+        raise ValueError(
+            "Chunked loss requires contiguous logits with token and vocabulary dimensions"
+        )
     if (
         logits.dtype not in (torch.float32, torch.float16, torch.bfloat16)
         or ignore_index != -100
@@ -335,7 +375,9 @@ def chunked_causal_loss(
     target = shift_labels.to(logits.device)
     if target.shape != logits.shape[:-1] or target.dtype != torch.long:
         raise ValueError("Labels must match logit token shape and use int64")
-    if not bool(((target == -100) | ((target >= 0) & (target < logits.shape[-1]))).all()):
+    if not bool(
+        ((target == -100) | ((target >= 0) & (target < logits.shape[-1]))).all()
+    ):
         raise ValueError("Labels must be ignored or valid vocabulary indices")
     if num_items_in_batch is None:
         denominator = (target != -100).sum().float()
@@ -350,4 +392,3 @@ def chunked_causal_loss(
         ):
             raise ValueError("Explicit item count must be a positive scalar")
     return _ChunkCE.apply(logits, target, denominator, chunk_tokens)
-

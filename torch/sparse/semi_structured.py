@@ -39,6 +39,36 @@ _SEMI_STRUCTURED_SPARSE_CONFIG = namedtuple(
 )
 
 
+def _gfx1013_from_dense(original, alg_id):
+    # torch.sparse is imported before torch.autograd during extension setup.
+    class _Gfx1013FromDense(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, original, alg_id):
+            result = SparseSemiStructuredTensorCUSPARSELT.from_dense(
+                original.detach(), alg_id
+            )
+            ctx.save_for_backward(result.packed)
+            ctx.shape = original.shape
+            return result
+
+        @staticmethod
+        @torch.autograd.function.once_differentiable
+        def backward(ctx, grad):
+            (packed,) = ctx.saved_tensors
+            m, k = ctx.shape
+            tags = packed.view(torch.uint8).flatten()[
+                m * k // 2 * packed.element_size() :
+            ]
+            tags = tags[: m * k // 4].long().view(m, k // 4, 1)
+            shifts = torch.arange(2, device=packed.device) * 2
+            indices = (tags >> shifts) & 3
+            mask = torch.zeros((m, k // 4, 4), device=packed.device, dtype=torch.bool)
+            mask.scatter_(2, indices, True)
+            return grad * mask.view(m, k), None
+
+    return _Gfx1013FromDense.apply(original, alg_id)
+
+
 class SparseSemiStructuredTensor(torch.Tensor):
     """
     This class implements semi-structured sparsity as a Tensor subclass.
@@ -572,6 +602,16 @@ class SparseSemiStructuredTensorCUSPARSELT(SparseSemiStructuredTensor):
         alg_id: int = SparseSemiStructuredTensor._DEFAULT_ALG_ID,
     ) -> "SparseSemiStructuredTensorCUSPARSELT":
         cls._validate_device_dim_dtype_shape(original_tensor)
+        if (
+            torch.is_grad_enabled()
+            and original_tensor.requires_grad
+            and torch.version.hip
+            and torch.cuda.get_device_properties(
+                original_tensor.device
+            ).gcnArchName.split(":")[0]
+            == "gfx1013"
+        ):
+            return _gfx1013_from_dense(original_tensor, alg_id)
         # pyrefly: ignore [no-matching-overload]
         return cls(
             shape=original_tensor.shape,
@@ -685,6 +725,19 @@ class SparseSemiStructuredTensorCUSPARSELT(SparseSemiStructuredTensor):
                 f"with A.dtype=B.dtype={self.dtype}. "
                 "mm is not supported for float8_e4m3fn, please use `torch._scaled_mm` instead."
             )
+        if (
+            self.packed is None
+            and self.packed_t is not None
+            and torch.version.hip
+            and torch.cuda.get_device_properties(self.device).gcnArchName.split(":")[0]
+            == "gfx1013"
+        ):
+            # A row-sparse matrix need not be row-sparse after transposition.
+            dense = torch._cslt_to_dense(self.packed_t, self.shape[0]).t()
+            result = dense @ (B.t() if should_transpose_dense else B)
+            if bias is not None:
+                result = result + bias[:, None]
+            return result.t().contiguous() if should_transpose_dense else result
         if self.packed is None:
             raise NotImplementedError(
                 f"`{self.__class__.__name__}` matmul: operation is not supported"

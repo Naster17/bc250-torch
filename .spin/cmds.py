@@ -1,4 +1,5 @@
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -283,10 +284,13 @@ def lazy_setup_lint(ctx, parent_callback, **kwargs):
         click.echo("Linting tools set up and hashes updated.")
     else:
         click.echo("No changes detected in lint configuration files. Skipping setup.")
-    click.echo("Regenerating version...")
-    ctx.invoke(regenerate_version)
-    click.echo("Regenerating type stubs...")
-    ctx.invoke(regenerate_type_stubs)
+    if os.environ.get("PYTORCH_LINT_SKIP_CODEGEN") == "1":
+        click.echo("Using existing generated files for linting.")
+    else:
+        click.echo("Regenerating version...")
+        ctx.invoke(regenerate_version)
+        click.echo("Regenerating type stubs...")
+        ctx.invoke(regenerate_type_stubs)
     click.echo("Done.")
     _check_linters()
 

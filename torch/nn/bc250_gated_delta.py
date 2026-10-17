@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Opt-in gfx1013 gated-delta preparation and eager chunked GPU attention.
 
-Preparation uses scalar Triton forward/backward kernels. Triangular solves,
-matmuls and the chunk scan use ATen. This is not the FLA package/backend.
+Standalone preparation uses scalar Triton kernels. The full operation uses
+reference-ordered ATen preparation for FP16/BF16 and native preparation for FP32.
+Triangular solves, matmuls and the chunk scan use ATen. This is not the FLA package/backend.
 Only floating eager first-order training is supported; chunk size is 64.
 """
 
@@ -10,6 +11,7 @@ import triton
 import triton.language as tl
 
 import torch
+import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
 
@@ -229,14 +231,7 @@ class _Preparation(torch.autograd.Function):
         return dq, dkout, dvout, dg, db, None
 
 
-def prepare_gated_delta(query, key, value, g, beta, *, normalize=True):
-    """Return FP32 padded/chunked (Q/sqrt(D), K, beta*K, beta*V, cumsum(g)).
-
-    Inputs are BLHD Q/K/V and BLH log-decay/beta on actual gfx1013; Q/K have
-    equal dimensions, all heads already expanded. Q/K normalization uses eps1e-6.
-    Valid strided tensors are copied on GPU. Chunk width is 64, Dk/Dv <=128.
-    Only eager first-order gradients are qualified, including both gates.
-    """
+def _validate_inputs(query, key, value, g, beta, normalize):
     tensors = (query, key, value, g, beta)
     if not all(isinstance(x, torch.Tensor) for x in tensors):
         raise TypeError("Expected Q/K/V/log-decay/beta tensors")
@@ -269,7 +264,43 @@ def prepare_gated_delta(query, key, value, g, beta, *, normalize=True):
         raise ValueError("Unsupported empty, head-width or padded token geometry")
     if not isinstance(normalize, bool):
         raise TypeError("normalize must be boolean")
-    return _Preparation.apply(*(x.contiguous() for x in tensors), normalize)
+
+
+def prepare_gated_delta(query, key, value, g, beta, *, normalize=True):
+    """Return FP32 padded/chunked (Q/sqrt(D), K, beta*K, beta*V, cumsum(g)).
+
+    Inputs are BLHD Q/K/V and BLH log-decay/beta on actual gfx1013; Q/K have
+    equal dimensions, all heads already expanded. Q/K normalization uses eps1e-6.
+    Valid strided tensors are copied on GPU. Chunk width is 64, Dk/Dv <=128.
+    Only eager first-order gradients are qualified, including both gates.
+    """
+    _validate_inputs(query, key, value, g, beta, normalize)
+    return _Preparation.apply(
+        *(x.contiguous() for x in (query, key, value, g, beta)), normalize
+    )
+
+
+def _reference_ordered_prepare(query, key, value, g, beta, normalize):
+    _validate_inputs(query, key, value, g, beta, normalize)
+    b, t, h, dk = query.shape
+    query, key, value, beta, g = [
+        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
+        for x in (query, key, value, beta, g)
+    ]
+    if normalize:
+        # Preserve reference operation order: small rounding changes can affect
+        # gradients after multiple BF16 layers. square() has a different VJP.
+        query = query * torch.rsqrt((query * query).sum(-1, keepdim=True) + 1e-6)
+        key = key * torch.rsqrt((key * key).sum(-1, keepdim=True) + 1e-6)
+    query = query * dk**-0.5
+    pad = (-t) % 64
+    query, key, value = [F.pad(x, (0, 0, 0, pad)) for x in (query, key, value)]
+    beta, g = [F.pad(x, (0, pad)) for x in (beta, g)]
+    vb, kb = value * beta.unsqueeze(-1), key * beta.unsqueeze(-1)
+    query, key, kb, vb = [
+        x.reshape(b, h, -1, 64, x.shape[-1]) for x in (query, key, kb, vb)
+    ]
+    return query, key, kb, vb, g.reshape(b, h, -1, 64).cumsum(-1)
 
 
 def chunk_gated_delta_rule(
@@ -283,15 +314,25 @@ def chunk_gated_delta_rule(
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
 ):
-    """Native preparation plus ATen triangular solves and sequential chunk scan.
+    """Precision-aware GPU preparation, ATen triangular solves and chunk scan.
 
     Explicit API; does not install a Transformers hook or advertise FLA support.
+    FP16/BF16 use reference-ordered ATen preparation for model-gradient parity;
+    FP32 outside autocast uses native preparation. The standalone native API remains
+    explicit and experimental for low-precision model integration.
     Initial state is FP32 [B,H,Dk,Dv] on the same device. Output has query dtype;
     returned final state is FP32. Log-decay is expected nonpositive, as in FLA.
     """
     if chunk_size != 64:
         raise ValueError("Only chunk_size=64 is supported")
-    q, k, kb, vb, decay = prepare_gated_delta(
+    prepare = (
+        prepare_gated_delta
+        if isinstance(query, torch.Tensor)
+        and query.dtype == torch.float32
+        and not torch.is_autocast_enabled("cuda")
+        else _reference_ordered_prepare
+    )
+    q, k, kb, vb, decay = prepare(
         query, key, value, g, beta, normalize=use_qk_l2norm_in_kernel
     )
     b, t, h, dk = query.shape
@@ -310,25 +351,24 @@ def chunk_gated_delta_rule(
     )
     system = (kb @ k.transpose(-1, -2)) * pair
     attention = (q @ k.transpose(-1, -2)) * pair
-    exp_decay = decay.exp().unsqueeze(-1)
+    decayed_k_beta = kb * decay.exp().unsqueeze(-1)
     u = torch.linalg.solve_triangular(system, vb, upper=False, unitriangular=True)
     w = torch.linalg.solve_triangular(
-        system, kb * exp_decay, upper=False, unitriangular=True
+        system, decayed_k_beta, upper=False, unitriangular=True
     )
-    q = q * exp_decay
+    q = q * decay.exp().unsqueeze(-1)
     k = k * (decay[..., -1:] - decay).exp().unsqueeze(-1)
+    chunk_decay = decay[..., -1].exp()[..., None, None]
     state = (
         torch.zeros((b, h, dk, dv), device=query.device, dtype=torch.float32)
         if initial_state is None
         else initial_state
     )
-    outputs = []
+    out = torch.zeros_like(u)
     for i in range(q.shape[2]):
         delta = u[:, :, i] - w[:, :, i] @ state
-        outputs.append(q[:, :, i] @ state + attention[:, :, i] @ delta)
-        state = (
-            state * decay[:, :, i, -1].exp()[..., None, None]
-            + k[:, :, i].transpose(-1, -2) @ delta
-        )
-    out = torch.stack(outputs, dim=2).flatten(2, 3)[:, :, :t].transpose(1, 2)
+        inter_chunk = q[:, :, i] @ state
+        out[:, :, i] = inter_chunk + attention[:, :, i] @ delta
+        state = state * chunk_decay[:, :, i] + k[:, :, i].transpose(-1, -2) @ delta
+    out = out.flatten(2, 3)[:, :, :t].transpose(1, 2)
     return out.to(query.dtype).contiguous(), state if output_final_state else None

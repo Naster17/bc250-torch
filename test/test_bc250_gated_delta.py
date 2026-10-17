@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +19,10 @@ if os.environ.get("BC250_A06_INSTALLED"):
     from torch.nn import bc250_gated_delta as ops
 else:
     spec = importlib.util.spec_from_file_location(
-        "gated_delta_candidate", Path(__file__).with_name("bc250_gated_delta.py")
+        "gated_delta_candidate",
+        os.environ.get(
+            "BC250_A06_CANDIDATE", Path(__file__).with_name("bc250_gated_delta.py")
+        ),
     )
     ops = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ops)
@@ -203,6 +207,32 @@ class TestGatedDelta(TestCase):
         for grad, ref in zip(actual, wanted):
             self.assertEqual(grad.cpu().double(), ref, atol=tol[0], rtol=tol[1])
         record(self._testMethodName, exact_chunk=True, low_precision_gates=True)
+
+    @dtypes(torch.float16, torch.bfloat16)
+    def test_low_precision_full_uses_reference(self, device, dtype):
+        xs = inputs(1, 65, 2, 7, 9, dtype, device)
+        refs = [x.detach().cpu().double().requires_grad_() for x in xs]
+        with mock.patch.object(
+            ops,
+            "prepare_gated_delta",
+            side_effect=AssertionError(
+                "Native low-precision preparation is experimental"
+            ),
+        ):
+            y, state = ops.chunk_gated_delta_rule(
+                *xs, output_final_state=True, use_qk_l2norm_in_kernel=True
+            )
+            actual = torch.autograd.grad((y.sum() + state.sum()), xs)
+        ref, sr = recurrent_reference(*refs, True)
+        expected = torch.autograd.grad(ref.sum() + sr.sum(), refs)
+        for a, b in [(y, ref), (state, sr), *zip(actual, expected)]:
+            self.assertEqual(
+                a.cpu().double(),
+                b,
+                atol=0.025 if dtype == torch.bfloat16 else 0.003,
+                rtol=0.04 if dtype == torch.bfloat16 else 0.008,
+            )
+        record(self._testMethodName, reference_ordered_low_precision=True)
 
     @dtypes(torch.float32)
     def test_refusals(self, device, dtype):

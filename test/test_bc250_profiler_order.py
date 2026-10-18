@@ -142,7 +142,7 @@ class TestBC250ProfilerOrder(TestCase):
             with self.subTest(order=order), tempfile.TemporaryDirectory() as output:
                 env = dict(os.environ)
                 if order == "masked":
-                    env["HIP_VISIBLE_DEVICES"] = "-1"
+                    env["HIP_VISIBLE_DEVICES"] = "999999"
                 subprocess.run(
                     [sys.executable, __file__, "--worker", order, "--output", output],
                     env=env,

@@ -281,6 +281,11 @@ std::tuple<Tensor&, Tensor&> triangular_solve_out_sparse_csr_cuda(
     Tensor& X,
     Tensor& clone_A) {
   sparse::impl::cuda::triangular_solve_out_sparse_csr(A, B, X, upper, transpose, unitriangular);
+#ifdef USE_ROCM
+  if (!unitriangular && X.numel() != 0 && A._nnz() != 0) {
+    sparse::impl::cuda::apply_sparse_triangular_solve_pivot_mask(A, X);
+  }
+#endif
   return std::tuple<Tensor&, Tensor&>(X, clone_A);
 }
 

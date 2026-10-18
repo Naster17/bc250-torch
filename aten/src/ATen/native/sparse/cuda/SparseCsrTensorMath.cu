@@ -808,4 +808,96 @@ Tensor _sparse_csr_linear_solve(const Tensor& A, const Tensor& b, const bool lef
 }
 
 
+#ifdef USE_ROCM
+namespace sparse::impl::cuda {
+namespace {
+
+__device__ bool sparse_pivot_is_exact_zero(float value) {
+  return (__float_as_uint(value) & 0x7fffffffu) == 0;
+}
+
+__device__ bool sparse_pivot_is_exact_zero(double value) {
+  return (__double_as_longlong(value) & 0x7fffffffffffffffLL) == 0;
+}
+
+template <typename real_t>
+__device__ bool sparse_pivot_is_exact_zero(c10::complex<real_t> value) {
+  return sparse_pivot_is_exact_zero(value.real()) &&
+      sparse_pivot_is_exact_zero(value.imag());
+}
+
+template <typename scalar_t, typename index_t>
+__global__ void sparse_triangular_pivot_mask_kernel(
+    const index_t* crow,
+    const index_t* columns,
+    const scalar_t* values,
+    scalar_t* output,
+    int64_t rows,
+    int64_t nrhs,
+    int64_t block_size,
+    int64_t value_stride,
+    int64_t diagonal_stride,
+    int64_t output_row_stride,
+    int64_t output_col_stride) {
+  for (int64_t row = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       row < rows;
+       row += int64_t(blockDim.x) * gridDim.x) {
+    const int64_t block_row = row / block_size;
+    index_t lo = crow[block_row];
+    const index_t end = crow[block_row + 1];
+    index_t hi = end;
+    // These native solve paths already require sorted compressed indices.
+    while (lo < hi) {
+      const index_t mid = lo + (hi - lo) / 2;
+      if (columns[mid] < block_row) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    if (lo == end || columns[lo] != block_row ||
+        sparse_pivot_is_exact_zero(values[int64_t(lo) * value_stride +
+               (row % block_size) * diagonal_stride])) {
+      // rocSPARSE avoids division by zero and may otherwise return finite
+      // placeholders. A NaN at the pivot row makes the singular result explicit.
+      // Other rows are unspecified on singular input; healthy output is untouched.
+      for (int64_t col = 0; col < nrhs; ++col) {
+        output[row * output_row_stride + col * output_col_stride] = scalar_t(NAN);
+      }
+    }
+  }
+}
+
+} // namespace
+
+void apply_sparse_triangular_solve_pivot_mask(
+    const at::sparse_csr::SparseCsrTensor& A,
+    const Tensor& X) {
+  const auto values = A.values();
+  const auto crow = A.crow_indices();
+  const auto columns = A.col_indices();
+  const int64_t block_size = A.layout() == kSparseBsr ? values.size(-1) : 1;
+  const int64_t diagonal_stride =
+      A.layout() == kSparseBsr ? values.stride(1) + values.stride(2) : 0;
+  constexpr int threads = 256;
+  const int blocks = std::min<int64_t>((A.size(0) + threads - 1) / threads, 65535);
+  AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
+      A.scalar_type(), "sparse_triangular_pivot_mask", [&] {
+        AT_DISPATCH_INDEX_TYPES(crow.scalar_type(), "sparse_triangular_pivot_mask_index", [&] {
+          sparse_triangular_pivot_mask_kernel<scalar_t, index_t>
+              <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                  crow.const_data_ptr<index_t>(),
+                  columns.const_data_ptr<index_t>(),
+                  values.const_data_ptr<scalar_t>(),
+                  X.data_ptr<scalar_t>(),
+                  A.size(0), X.size(1), block_size, values.stride(0),
+                  diagonal_stride, X.stride(0), X.stride(1));
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+      });
+}
+
+} // namespace sparse::impl::cuda
+#endif
+
 } // namespace at::native

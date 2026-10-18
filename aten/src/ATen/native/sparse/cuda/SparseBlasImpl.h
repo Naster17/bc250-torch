@@ -36,6 +36,13 @@ void triangular_solve_out_sparse_csr(
     bool transpose,
     bool unitriangular);
 
+#ifdef USE_ROCM
+// Mark exact missing/zero diagonal pivots after ROCm's division-avoiding solve.
+void apply_sparse_triangular_solve_pivot_mask(
+    const at::sparse_csr::SparseCsrTensor& A,
+    const Tensor& X);
+#endif
+
 void sampled_addmm_out_sparse_csr(
     const Tensor& mat1,
     const Tensor& mat2,

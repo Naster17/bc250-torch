@@ -143,7 +143,6 @@ class TestBC250ProfilerOrder(TestCase):
                 env = dict(os.environ)
                 if order == "masked":
                     env["HIP_VISIBLE_DEVICES"] = "-1"
-                    env["ROCR_VISIBLE_DEVICES"] = "-1"
                 subprocess.run(
                     [sys.executable, __file__, "--worker", order, "--output", output],
                     env=env,

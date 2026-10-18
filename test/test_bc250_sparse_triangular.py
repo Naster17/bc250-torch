@@ -314,21 +314,53 @@ def main() -> None:
                     a = torch.sparse_csr_tensor(
                         row, cols, vals, size=(6, 6), check_invariants=True
                     )
-                result = torch.triangular_solve(
-                    torch.ones(6, nrhs, dtype=dtype, device="cuda"),
-                    a.cuda(),
-                    upper=False,
-                    unitriangular=kind == "empty-unit",
-                ).solution
-                torch.cuda.synchronize()
-                # Legacy public sparse API documents/retains NaN for empty A;
-                # for singular nonempty matrices record nonfinite behavior.
-                CHECK.assertTrue(not bool(torch.isfinite(result).all()), result)
+                ga = a.cuda()
+                old_indices = [
+                    z.clone()
+                    for z in (ga.crow_indices(), ga.col_indices(), ga.values())
+                ]
+                backing = torch.full(
+                    (14, 2 * nrhs + 3),
+                    711 - 29j if dtype.is_complex else 711,
+                    dtype=dtype,
+                    device="cuda",
+                )
+                out = backing[1:13:2, 1 : 2 * nrhs + 1 : 2]
+                mask = torch.zeros_like(backing, dtype=torch.bool)
+                mask[1:13:2, 1 : 2 * nrhs + 1 : 2] = True
+                guards = backing[~mask].clone()
+                rhs = torch.ones(6, nrhs, dtype=dtype, device="cuda")
+                saved_rhs = rhs.clone()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    result = torch.triangular_solve(
+                        rhs,
+                        ga,
+                        upper=False,
+                        unitriangular=kind == "empty-unit",
+                        out=(out, torch.empty(0, dtype=dtype, device="cuda")),
+                    ).solution
+                stream.synchronize()
+                CHECK.assertTrue(result.data_ptr() == out.data_ptr())
+                if kind.startswith("empty"):
+                    CHECK.assertTrue(bool(result.isnan().all()))
+                else:
+                    pivot = 2 if kind == "missing-block" else 3
+                    CHECK.assertTrue(bool(result[pivot].isnan().all()), result)
+                torch.testing.assert_close(backing[~mask], guards, rtol=0, atol=0)
+                torch.testing.assert_close(rhs, saved_rhs, rtol=0, atol=0)
+                for original, saved in zip(
+                    (ga.crow_indices(), ga.col_indices(), ga.values()), old_indices
+                ):
+                    torch.testing.assert_close(original, saved, rtol=0, atol=0)
                 return dict(
                     nan=int(result.isnan().sum()),
                     inf=int(result.isinf().sum()),
                     numel=result.numel(),
-                    behavior="nonfinite-singular-or-legacy-empty",
+                    behavior="nan-at-pivot-or-legacy-empty",
+                    output_guards=True,
+                    nondefault_stream=True,
                 )
 
             check(f"{dtype}_{layout}_rhs{nrhs}_{kind}", edge)

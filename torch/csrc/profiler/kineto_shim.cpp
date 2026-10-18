@@ -1,3 +1,4 @@
+#include <ATen/Context.h>
 #include <torch/csrc/profiler/collection.h>
 #include <torch/csrc/profiler/kineto_shim.h>
 
@@ -301,7 +302,15 @@ void prepareTrace(
 #ifdef USE_KINETO
   libkineto::api().resetKinetoTLS();
   if (!libkineto::api().isProfilerRegistered()) {
-    libkineto_init(/*cpuOnly=*/cpuOnly, /*logOnError=*/true);
+    bool cpuOnlyInit = cpuOnly;
+#ifdef USE_ROCM
+    // Kineto fixes ROCm tracing capability at construction. Keep an available
+    // GPU backend even when the first capture selects only CPU activities;
+    // the activity set below still controls which events each capture records.
+    // With no visible GPU, retain CPU-only initialization.
+    cpuOnlyInit = cpuOnly && at::getNumGPUs() == 0;
+#endif
+    libkineto_init(/*cpuOnly=*/cpuOnlyInit, /*logOnError=*/true);
     libkineto::api().suppressLogMessages();
   }
 

@@ -115,7 +115,7 @@ ncclRedOpRAII getNcclReduceOp(
         case ncclFloat:
           return unpackPreMulSum<float, ncclFloat>(reduceOp, comm);
         case ncclBfloat16:
-          return unpackPreMulSum<float, ncclBfloat16>(reduceOp, comm);
+          return unpackPreMulSum<at::BFloat16, ncclBfloat16>(reduceOp, comm);
         case ncclDouble:
           return unpackPreMulSum<double, ncclDouble>(reduceOp, comm);
         default:

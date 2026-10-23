@@ -319,6 +319,13 @@ static void check_tensor(
   }
 }
 
+static void check_reduction_type(const at::Tensor& tensor) {
+  TORCH_CHECK(
+      !c10::isFloat8Type(tensor.scalar_type()),
+      "NCCL numeric reductions do not support Float8 tensors; "
+      "Float8 byte-copy operations remain available");
+}
+
 void check_inputs(
     TensorList inputs,
     TensorList outputs,
@@ -580,6 +587,7 @@ void reduce(
       root >= 0 && static_cast<size_t>(root) < inputs.size(), "invalid root");
 
   check_inputs(inputs, output, root, 1, 1);
+  check_reduction_type(inputs[0]);
   const auto len = inputs.size();
 
   auto data_type = to_nccl_data_type(inputs[0]);
@@ -634,6 +642,7 @@ void all_reduce(
 #ifdef USE_NCCL
   using namespace torch::cuda::nccl::detail;
   check_inputs(inputs, outputs, 1, 1);
+  check_reduction_type(inputs[0]);
   const auto len = inputs.size();
 
   auto data_type = to_nccl_data_type(inputs[0]);
@@ -677,6 +686,7 @@ void reduce_scatter(
   using namespace torch::cuda::nccl::detail;
   const auto len = inputs.size();
   check_inputs(inputs, outputs, 1, len);
+  check_reduction_type(inputs[0]);
 
   auto data_type = to_nccl_data_type(inputs[0]);
 

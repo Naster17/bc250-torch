@@ -7,6 +7,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 
@@ -54,7 +55,17 @@ const std::map<ReduceOp::RedOpType, ncclRedOp_t> ncclOp = {
     {ReduceOp::AVG, ncclAvg},
 };
 
-inline bool isUnsupportedFloat8(at::ScalarType t) {
+inline bool isUnsupportedFloat8(const at::Tensor& tensor) {
+  const auto t = tensor.scalar_type();
+#ifdef USE_ROCM
+  if (c10::isFloat8Type(t) && tensor.is_cuda()) {
+    const auto* props = at::cuda::getDeviceProperties(tensor.get_device());
+    // The native gfx1013 RCCL profile excludes FP8 reduction kernels.
+    if (std::string(props->gcnArchName).compare(0, 7, "gfx1013") == 0) {
+      return true;
+    }
+  }
+#endif
   return (
       t == at::ScalarType::Float8_e5m2fnuz ||
       t == at::ScalarType::Float8_e4m3fnuz ||
@@ -4455,7 +4466,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_sparse(
   TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
   auto tensor = tensors.back();
   TORCH_CHECK(
-      !isUnsupportedFloat8(tensor.scalar_type()),
+      !isUnsupportedFloat8(tensor),
       "Unsupported Float8 type for NCCL reduction");
 #ifdef IS_NCCLX
   tensor = tensor.coalesce();
@@ -4580,7 +4591,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce(
     }
   }
   TORCH_CHECK(
-      !isUnsupportedFloat8(tensor.scalar_type()),
+      !isUnsupportedFloat8(tensor),
       "Unsupported Float8 type for NCCL reduction");
   RECORD_PARAM_COMMS_DATA_WITH_ASYNC_OP(
       std::make_tuple(
@@ -4610,7 +4621,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::allreduce_coalesced(
     const AllreduceCoalescedOptions& opts) {
   auto total_numel = check_gpu_tensors_same_device(tensors);
   TORCH_CHECK(
-      !isUnsupportedFloat8(tensors.back().scalar_type()),
+      !isUnsupportedFloat8(tensors.back()),
       "Unsupported Float8 type for NCCL reduction");
 
   RECORD_PARAM_COMMS_DATA_WITH_ASYNC_OP(
@@ -5014,7 +5025,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter(
   check_gpu_single_tensor(outputTensor);
   auto inputTensors_ = inputTensors.back();
   TORCH_CHECK(
-      !isUnsupportedFloat8(outputTensor.scalar_type()),
+      !isUnsupportedFloat8(outputTensor),
       "Unsupported Float8 type for NCCL reduction");
 
   RECORD_PARAM_COMMS_DATA_WITH_ASYNC_OP(
@@ -5128,7 +5139,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::_reduce_scatter_base(
 
   const auto& tensor = outputTensor;
   TORCH_CHECK(
-      !isUnsupportedFloat8(tensor.scalar_type()),
+      !isUnsupportedFloat8(tensor),
       "Unsupported Float8 type for NCCL reduction");
   RECORD_PARAM_COMMS_DATA_WITH_ASYNC_OP(
       std::make_tuple(
@@ -5196,7 +5207,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce_scatter_tensor_coalesced(
     std::vector<at::Tensor>& inputs,
     const ReduceScatterOptions& opts) {
   TORCH_CHECK(
-      !isUnsupportedFloat8(inputs.back().scalar_type()),
+      !isUnsupportedFloat8(inputs.back()),
       "Unsupported Float8 type for NCCL reduction");
 
   RECORD_PARAM_COMMS_DATA_WITH_ASYNC_OP(

@@ -58,6 +58,27 @@ broadcast_dtypes = (
 
 class TestNCCL(TestCase):
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @dtypes(
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    )
+    def test_float8_reductions_rejected(self, device, dtype):
+        if not c10d.is_nccl_available():
+            self.skipTest("NCCL not available")
+        tensor = torch.empty(17, device=device, dtype=dtype)
+        output = torch.empty_like(tensor)
+        operations = (
+            lambda: nccl.all_reduce([tensor], [output]),
+            lambda: nccl.reduce([tensor], output),
+            lambda: nccl.reduce_scatter([tensor], [output]),
+        )
+        for operation in operations:
+            with self.assertRaisesRegex(RuntimeError, "numeric reductions.*Float8"):
+                operation()
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
     def test_unique_id(self, device):
         uid = nccl.unique_id()
         self.assertIsInstance(uid, bytes)

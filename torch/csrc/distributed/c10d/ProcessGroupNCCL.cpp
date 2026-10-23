@@ -4778,6 +4778,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::reduce(
     tensor = at::view_as_real(tensor);
   }
   check_gpu_single_tensor(tensor);
+  TORCH_CHECK(
+      !isUnsupportedFloat8(tensor),
+      "Unsupported Float8 type for NCCL reduction");
   RECORD_PARAM_COMMS_DATA_WITH_ASYNC_OP(
       std::make_tuple(
           static_cast<int64_t>(seqCollective_) + 1,
@@ -4840,6 +4843,9 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::_reduce_oop(
         ValueError,
         "Tensor input and output of _reduce_oop must have the same number of elements ");
   }
+  TORCH_CHECK(
+      !isUnsupportedFloat8(inputTensor),
+      "Unsupported Float8 type for NCCL reduction");
   return collective(
       inputTensor,
       outputTensor,

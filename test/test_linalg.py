@@ -27,8 +27,7 @@ from torch.testing._internal.common_utils import \
      TEST_WITH_ROCM, IS_FBCODE, IS_REMOTE_GPU, iter_indices,
      make_fullrank_matrices_with_distinct_singular_values,
      freeze_rng_state, IS_ARM64, IS_SANDCASTLE, TEST_OPT_EINSUM, isRocmArchAnyOf, parametrize, skipIfTorchDynamo,
-     skipIfRocmArch, skipIfRocmVersionAtLeast, setBlasBackendsToDefaultFinally, setLinalgBackendsToDefaultFinally, serialTest, skipIfRocm,
-     with_ieee_matmul_precision, runOnRocmArch, MI200_ARCH, MI300_ARCH, MI350_ARCH, NAVI_ARCH, TEST_CUDA)
+     skipIfRocmArch, skipIfRocmVersionAtLeast, setBlasBackendsToDefaultFinally, setLinalgBackendsToDefaultFinally, serialTest, with_ieee_matmul_precision, runOnRocmArch, MI200_ARCH, MI300_ARCH, MI350_ARCH, NAVI_ARCH, TEST_CUDA)
 from torch.testing._internal.common_device_type import \
     (instantiate_device_type_tests, dtypes, has_cusolver, onlyCPU, skipCPUIfNoLapack, precisionOverride,
      skipCUDAIf,
@@ -6932,6 +6931,35 @@ scipy_lobpcg  | {eq_err_scipy:10.2e}  | {eq_err_general_scipy:10.2e}  | {iters2:
 
         mean_err = ((res - ref).abs() / ref).mean()
         self.assertTrue(mean_err < 0.05)
+
+    @onlyCUDA
+    @dtypes(torch.float16, torch.bfloat16, torch.float32)
+    @parametrize("layout", ["transpose", "slice", "expand"])
+    @parametrize("strided_scale", [False, True])
+    def test_weight_int8pack_mm_layouts(self, device, dtype, layout, strided_scale):
+        if layout == "transpose":
+            x = torch.arange(21, device=device, dtype=dtype).reshape(7, 3).t() / 8
+        elif layout == "slice":
+            x = torch.arange(42, device=device, dtype=dtype).reshape(3, 14)[:, ::2]
+        else:
+            x = torch.arange(7, device=device, dtype=dtype).expand(3, 7)
+        self.assertFalse(x.is_contiguous())
+        weight = (torch.arange(35, device=device).reshape(7, 5) % 7 - 3).to(torch.int8).t()
+        scale = torch.arange(1, 6, device=device, dtype=torch.float32) / 8
+        if strided_scale:
+            storage = torch.full((10,), 19.0, device=device)
+            storage[::2] = scale
+            scale = storage[::2]
+        x_before, weight_before, scale_before = x.clone(), weight.clone(), scale.clone()
+        expected = (
+            x.cpu().double() @ weight.cpu().double().t()
+        ) * scale.cpu().double()
+        self.assertEqual(
+            torch._weight_int8pack_mm(x, weight, scale), expected.to(dtype), atol=0, rtol=0
+        )
+        self.assertEqual(x, x_before)
+        self.assertEqual(weight, weight_before)
+        self.assertEqual(scale, scale_before)
 
     @slowTest
     @onlyCPU

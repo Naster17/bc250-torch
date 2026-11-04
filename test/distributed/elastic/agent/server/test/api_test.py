@@ -493,6 +493,7 @@ class SimpleElasticAgentTest(unittest.TestCase):
         agent = TestAgent(spec)
         agent._worker_group.state = WorkerState.SUCCEEDED
         agent._worker_group.group_world_size = 1
+        agent._worker_group.group_rank = 0
         agent._store = MagicMock()
 
         flag_during_barrier = []
@@ -501,7 +502,7 @@ class SimpleElasticAgentTest(unittest.TestCase):
             flag_during_barrier.append(agent._in_exit_barrier)
 
         with patch(
-            "torch.distributed.elastic.utils.store.barrier",
+            "torch.distributed.elastic.utils.store.synchronize",
             side_effect=mock_barrier,
         ):
             agent._exit_barrier()
@@ -517,10 +518,11 @@ class SimpleElasticAgentTest(unittest.TestCase):
         agent = TestAgent(spec)
         agent._worker_group.state = WorkerState.SUCCEEDED
         agent._worker_group.group_world_size = 1
+        agent._worker_group.group_rank = 0
         agent._store = MagicMock()
 
         with patch(
-            "torch.distributed.elastic.utils.store.barrier",
+            "torch.distributed.elastic.utils.store.synchronize",
             side_effect=Exception("wait timeout"),
         ):
             agent._exit_barrier()

@@ -991,11 +991,17 @@ class SimpleElasticAgent(ElasticAgent):
         start = time.time()
         self._in_exit_barrier = True
         try:
-            store_util.barrier(
+            # The rank-zero agent owns the TCPStore daemon. A symmetric barrier
+            # can let it close the store before a peer issues its final wait.
+            # synchronize/get_all keeps rank zero alive until peers have finished
+            # their store reads; only rank zero waits on the final completion key.
+            store_util.synchronize(
                 store=self._store,
+                data=b"",
+                rank=self._worker_group.group_rank,
                 world_size=self._worker_group.group_world_size,
                 key_prefix=_TERMINAL_STATE_SYNC_ID,
-                barrier_timeout=self._exit_barrier_timeout,
+                timeout=self._exit_barrier_timeout,
             )
             logger.info(
                 "Done waiting for other agents. Elapsed: %s seconds",

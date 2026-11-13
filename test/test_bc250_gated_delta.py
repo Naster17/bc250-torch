@@ -139,7 +139,8 @@ class TestGatedDelta(TestCase):
     @dtypes(torch.float32, torch.float16, torch.bfloat16)
     @parametrize("normalize", [False, True])
     @parametrize("length", [1, 65, 129])
-    def test_recurrent(self, device, dtype, normalize, length):
+    @parametrize("fused", [False, True])
+    def test_recurrent(self, device, dtype, normalize, length, fused):
         xs = inputs(1, length, 2, 7, 9, dtype, device)
         state = (torch.randn(1, 2, 7, 9, device=device) * 0.03).requires_grad_()
         refs = [x.detach().cpu().double().requires_grad_() for x in (*xs, state)]
@@ -148,6 +149,7 @@ class TestGatedDelta(TestCase):
             initial_state=state,
             output_final_state=True,
             use_qk_l2norm_in_kernel=normalize,
+            use_fused_solve_scan=fused,
         )
         yr, sr = recurrent_reference(*refs[:5], normalize, refs[5])
         gy, gs = torch.randn_like(y) * 0.1, torch.randn_like(s) * 0.1
@@ -162,7 +164,12 @@ class TestGatedDelta(TestCase):
         }[dtype]
         for a, r in [(y, yr), (s, sr), *zip(actual, expected)]:
             self.assertEqual(a.cpu().double(), r, atol=tol[0], rtol=tol[1])
-        record(self._testMethodName, cpu_recurrent_reference=True, state_gradient=True)
+        record(
+            self._testMethodName,
+            cpu_recurrent_reference=True,
+            state_gradient=True,
+            fused=fused,
+        )
 
     @dtypes(torch.float32)
     def test_zero_and_subsets(self, device, dtype):
@@ -233,6 +240,86 @@ class TestGatedDelta(TestCase):
                 rtol=0.04 if dtype == torch.bfloat16 else 0.008,
             )
         record(self._testMethodName, reference_ordered_low_precision=True)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize(
+        "geometry", [(2, 7, 3, 7, 11), (1, 129, 2, 128, 128), (1, 257, 2, 32, 16)]
+    )
+    def test_fused_matches_default(self, device, dtype, geometry):
+        # Pre-declared D68 bounds: fused vs default rel-L2 (D66 op bounds).
+        bound = 1e-5 if dtype == torch.float32 else 1e-2
+        xs = inputs(*geometry, dtype, device)
+        b, t, h, dk, dv = geometry
+        state = (torch.randn(b, h, dk, dv, device=device) * 0.03).requires_grad_()
+        torch.manual_seed(6806)
+        gy = torch.randn(b, t, h, dv, device=device) * 0.1
+        gs = torch.randn(b, h, dk, dv, device=device) * 0.1
+
+        def run(fused):
+            params = [x.detach().clone().requires_grad_(True) for x in xs]
+            s0 = state.detach().clone().requires_grad_(True)
+            y, s = ops.chunk_gated_delta_rule(
+                *params,
+                initial_state=s0,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_fused_solve_scan=fused,
+            )
+            grads = torch.autograd.grad((y, s), (*params, s0), (gy, gs))
+            return y, s, grads
+
+        y0, s0, g0 = run(False)
+        y1, s1, g1 = run(True)
+        for a, b in [(y1, y0), (s1, s0), *zip(g1, g0)]:
+            rel = float(
+                (a.double() - b.double()).norm()
+                / b.double().norm().clamp_min(1e-30)
+            )
+            self.assertLessEqual(rel, bound)
+        record(self._testMethodName, fused_default_rel_l2_bound=bound)
+
+    @dtypes(torch.float16, torch.bfloat16)
+    def test_fused_low_precision_uses_reference_prepare(self, device, dtype):
+        xs = inputs(1, 65, 2, 7, 9, dtype, device)
+        refs = [x.detach().cpu().double().requires_grad_() for x in xs]
+        with mock.patch.object(
+            ops,
+            "prepare_gated_delta",
+            side_effect=AssertionError(
+                "Native low-precision preparation is experimental"
+            ),
+        ):
+            y, state = ops.chunk_gated_delta_rule(
+                *xs,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_fused_solve_scan=True,
+            )
+            actual = torch.autograd.grad((y.sum() + state.sum()), xs)
+        ref, sr = recurrent_reference(*refs, True)
+        expected = torch.autograd.grad(ref.sum() + sr.sum(), refs)
+        for a, b in [(y, ref), (state, sr), *zip(actual, expected)]:
+            self.assertEqual(
+                a.cpu().double(),
+                b,
+                atol=0.025 if dtype == torch.bfloat16 else 0.003,
+                rtol=0.04 if dtype == torch.bfloat16 else 0.008,
+            )
+        record(self._testMethodName, fused_reference_ordered_low_precision=True)
+
+    @dtypes(torch.float32)
+    def test_fused_refusals(self, device, dtype):
+        xs = inputs(1, 7, 2, 7, 9, dtype, device)
+        with self.assertRaises(TypeError):
+            ops.chunk_gated_delta_rule(*xs, use_fused_solve_scan=1)
+        with self.assertRaises(TypeError):
+            ops.chunk_gated_delta_rule(*xs, use_fused_solve_scan="yes")
+        # Saved-state buffer cap: 33*16*8*128*128*4 bytes > 256 MiB, while the
+        # padded-token geometry stays inside the ordinary op limit.
+        big = inputs(33, 512, 16, 128, 128, dtype, device)
+        with self.assertRaises(ValueError):
+            ops.chunk_gated_delta_rule(*big, use_fused_solve_scan=True)
+        record(self._testMethodName, fused_refusals=3)
 
     @dtypes(torch.float32)
     def test_refusals(self, device, dtype):
